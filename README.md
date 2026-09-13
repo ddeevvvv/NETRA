@@ -1,4 +1,4 @@
-# IBVAP — Intelligent Border Video Analytics Platform
+# NETRA — Intelligent Border Video Analytics Platform (IBVAP)
 
 AI-based video analytics middleware ingesting IP-camera RTSP/ONVIF streams with real-time detection, tracking, virtual-fence intrusion, ANPR, face recognition, and human-acknowledged alerting. Built for SIH 2026.
 
@@ -209,3 +209,4 @@ Open `http://localhost:8000/api/v1/cameras/CAM-TEST-01/debug/stream` or `http://
 # Run all 26 backend unit and integration tests
 $env:PYTHONPATH="backend"; python -m pytest backend/tests -v
 ```
+
