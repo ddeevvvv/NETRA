@@ -12,10 +12,69 @@ import numpy as np
 from app.db.session import SessionLocal
 from app.models.zone import Zone
 from app.models.watchlist import WatchlistEntry
-from app.analytics.zone_engine import ZoneEngine
+from app.analytics.zone_engine import ZoneEngine, is_point_in_polygon
 from app.inference.anpr import ANPRProcessor
+from app.inference.face_detector import FaceDetector
 
 logger = logging.getLogger("ibvap.ingestion.worker")
+
+
+def _draw_pill_badge(img, text: str, x: int, y: int, accent_color: tuple, font_scale: float = 0.40):
+    """
+    Renders a defense-grade floating pill badge:
+    - Slate-900 semi-transparent backdrop: rgba(15, 23, 42, 0.82) -> BGR (42, 23, 15)
+    - 1px subtle border: (59, 41, 30)
+    - Colored accent indicator dot
+    - Crisp white anti-aliased text
+    - Clamped within image boundaries so it never clips
+    """
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    thickness = 1
+    (tw, th), baseline = cv2.getTextSize(text, font, font_scale, thickness)
+    pad_h = 5
+    pad_v = 3
+    dot_r = 3
+    dot_gap = 5
+
+    h, w = img.shape[:2]
+    badge_w = pad_h + (dot_r * 2) + dot_gap + tw + pad_h
+    badge_h = th + pad_v * 2 + 2
+
+    bx1 = max(2, min(x, w - badge_w - 2))
+    if y - badge_h - 2 >= 0:
+        by1 = y - badge_h - 2
+    else:
+        by1 = min(y + 4, h - badge_h - 2)
+    by2 = by1 + badge_h
+
+    # Semi-transparent dark pill background (Slate-900 BGR)
+    sub_img = img[by1:by2, bx1:bx1 + badge_w]
+    if sub_img.shape[0] == badge_h and sub_img.shape[1] == badge_w:
+        rect = np.full(sub_img.shape, (42, 23, 15), dtype=np.uint8)
+        cv2.addWeighted(rect, 0.82, sub_img, 0.18, 0, sub_img)
+        img[by1:by2, bx1:bx1 + badge_w] = sub_img
+
+    # 1px subtle border
+    cv2.rectangle(img, (bx1, by1), (bx1 + badge_w, by2), (59, 41, 30), 1)
+
+    # Accent status dot
+    dot_x = bx1 + pad_h + dot_r
+    dot_y = by1 + badge_h // 2
+    cv2.circle(img, (dot_x, dot_y), dot_r, accent_color, -1)
+
+    # Sharp white text (LINE_AA for smooth edges)
+    text_x = dot_x + dot_r + dot_gap
+    text_y = by1 + pad_v + th
+    cv2.putText(
+        img,
+        text,
+        (text_x, text_y),
+        font,
+        font_scale,
+        (255, 255, 255),
+        1,
+        cv2.LINE_AA,
+    )
 
 
 class CameraWorker:
@@ -63,11 +122,14 @@ class CameraWorker:
         self.latest_frame_raw: Optional[np.ndarray] = None
         self.latest_frame_annotated: Optional[np.ndarray] = None
         self.latest_detections: List[Dict[str, Any]] = []
+        self.latest_face_detections: List[Dict[str, Any]] = []
+        self._last_face_event_time: Dict[str, float] = {}
 
         # Lazy-loaded inference components (set by manager after init)
         self._detector = None
         self._tracker = None
         self._anpr: Optional[ANPRProcessor] = None
+        self._face_detector: Optional[FaceDetector] = None
 
         # Zone Analytics Engine & Zones
         self._zone_engine = ZoneEngine(temporal_confirmation_frames=2, track_timeout_seconds=3.0)
@@ -80,11 +142,12 @@ class CameraWorker:
         self.recent_anpr_crops: List[Dict[str, Any]] = []
         self._last_watchlist_sync_time = 0.0
 
-    def set_inference(self, detector, tracker, anpr: Optional[ANPRProcessor] = None):
-        """Attach Detector + Tracker + ANPR after construction."""
+    def set_inference(self, detector, tracker, anpr: Optional[ANPRProcessor] = None, face_detector: Optional[FaceDetector] = None):
+        """Attach Detector + Tracker + ANPR + FaceDetector after construction."""
         self._detector = detector
         self._tracker = tracker
         self._anpr = anpr if anpr is not None else ANPRProcessor()
+        self._face_detector = face_detector
 
     async def reload_zones(self):
         """Loads zones associated with this camera from database."""
@@ -202,6 +265,8 @@ class CameraWorker:
 
         if self.enable_inference and self._anpr is None:
             self._anpr = ANPRProcessor()
+        if self.enable_inference and self._face_detector is None:
+            self._face_detector = FaceDetector()
 
         cap = None
         last_sample_time = 0.0
@@ -477,6 +542,67 @@ class CameraWorker:
 
                 detections = tracks
 
+                # 7c. Face Detection & Restricted Zone Alerting
+                if self._face_detector is not None:
+                    try:
+                        detected_faces = self._face_detector.detect(frame)
+                        self.latest_face_detections = detected_faces
+
+                        for face in detected_faces:
+                            fb = face["bbox"]
+                            fcx = (fb[0] + fb[2]) / 2.0
+                            fcy = (fb[1] + fb[3]) / 2.0
+                            face_ref = (fcx / max(frame.shape[1], 1), fcy / max(frame.shape[0], 1))
+
+                            for z in self._zones:
+                                restriction = z.get("restriction_level", "RESTRICTED").upper()
+                                if restriction != "RESTRICTED":
+                                    continue
+                                poly = z.get("polygon_coords", [])
+                                if not poly or len(poly) < 3:
+                                    continue
+
+                                if is_point_in_polygon(face_ref, poly):
+                                    # Match face to person track if face center is enclosed in track bbox
+                                    matched_track_id = None
+                                    for t in tracks:
+                                        if t.get("object_class") == "person":
+                                            tb = t.get("bbox", [0, 0, 0, 0])
+                                            if tb[0] <= fcx <= tb[2] and tb[1] <= fcy <= tb[3]:
+                                                matched_track_id = t.get("track_id")
+                                                break
+
+                                    debounce_key = f"{z.get('id')}:{matched_track_id}" if matched_track_id is not None else f"{z.get('id')}:face_{int(face_ref[0]*100)}_{int(face_ref[1]*100)}"
+                                    if (now - self._last_face_event_time.get(debounce_key, 0.0)) >= 5.0:
+                                        self._last_face_event_time[debounce_key] = now
+                                        face_payload = {
+                                            "camera_id": self.camera_id,
+                                            "type": "FACE_DETECTED",
+                                            "severity": "INFO",
+                                            "timestamp": datetime.now(timezone.utc).isoformat(),
+                                            "object_type": "face",
+                                            "track_id": matched_track_id,
+                                            "confidence": face["confidence"],
+                                            "zone_id": z.get("id"),
+                                            "evidence": {},
+                                            "metadata": {
+                                                "rule_name": "Face in Restricted Zone",
+                                                "zone_name": z.get("name", z.get("id")),
+                                                "restriction_level": "RESTRICTED",
+                                                "face_bbox": [round(c, 1) for c in fb],
+                                                "associated_track_id": matched_track_id,
+                                            }
+                                        }
+                                        asyncio.create_task(self._post_event(face_payload))
+                                        logger.info(
+                                            f"[{self.camera_id}] EMIT FACE_DETECTED (INFO) - Face in restricted zone "
+                                            f"{z.get('id')} (conf={face['confidence']}, track={matched_track_id})"
+                                        )
+                    except Exception as e:
+                        logger.warning(f"[{self.camera_id}] Error in face detection loop: {e}")
+            else:
+                self.latest_face_detections = []
+
             # ── 8. Render Zone Polygons & Detections on Annotated Frame ───────
             h, w = frame.shape[:2]
             overlay = annotated.copy()
@@ -495,20 +621,12 @@ class CameraWorker:
                 poly_color = (0, 0, 220) if is_restricted else (220, 200, 0)
 
                 cv2.fillPoly(overlay, [pts], poly_color)
-                cv2.polylines(annotated, [pts], isClosed=True, color=poly_color, thickness=2)
+                cv2.polylines(annotated, [pts], isClosed=True, color=poly_color, thickness=1)
 
                 lbl_x = int(pts[0][0][0])
-                lbl_y = max(int(pts[0][0][1]) - 8, 18)
+                lbl_y = int(pts[0][0][1])
                 zone_label = f"[{z.get('restriction_level', 'RESTRICTED')}] {z.get('id', '')}: {z.get('name', '')}"
-                cv2.putText(
-                    annotated,
-                    zone_label,
-                    (lbl_x, lbl_y),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.5,
-                    poly_color,
-                    2,
-                )
+                _draw_pill_badge(annotated, zone_label, lbl_x, lbl_y, poly_color, font_scale=0.38)
 
             if has_zones:
                 cv2.addWeighted(overlay, 0.25, annotated, 0.75, 0, annotated)
@@ -544,17 +662,26 @@ class CameraWorker:
                     status_tag = ""
 
                 plate_tag = f" · {plate_text}" if plate_text else ""
-                label = f"#{tid} {obj_class} {conf:.2f}{status_tag}{plate_tag}"
+                label = f"#{tid} {obj_class} {int(conf * 100)}%{status_tag}{plate_tag}"
 
-                cv2.rectangle(annotated, (x1, y1), (x2, y2), box_color, 2)
-                cv2.putText(
+                # 1.5px / 1px crisp bounding box
+                cv2.rectangle(annotated, (x1, y1), (x2, y2), box_color, 1)
+                # Floating pill badge with Slate-900 backdrop and accent dot
+                _draw_pill_badge(annotated, label, x1, y1, box_color, font_scale=0.38)
+
+            # Draw face detection bounding boxes (1px stroke + non-overlapping pill badge below)
+            for f in self.latest_face_detections:
+                fx1, fy1, fx2, fy2 = int(f["bbox"][0]), int(f["bbox"][1]), int(f["bbox"][2]), int(f["bbox"][3])
+                fconf = f["confidence"]
+                face_color = (255, 180, 0)  # Defense cyan/blue in BGR
+                cv2.rectangle(annotated, (fx1, fy1), (fx2, fy2), face_color, 1)
+                _draw_pill_badge(
                     annotated,
-                    label,
-                    (x1, max(y1 - 8, 12)),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.55,
-                    box_color,
-                    2,
+                    f"FACE {int(fconf * 100)}%",
+                    fx1,
+                    fy2 + 16,
+                    face_color,
+                    font_scale=0.34,
                 )
 
             self.latest_detections = detections

@@ -15,21 +15,25 @@ class IngestionManager:
         self.workers: Dict[str, CameraWorker] = {}
         self.tasks: Dict[str, asyncio.Task] = {}
         self._detector = None  # shared singleton across all workers
+        self._face_detector = None  # shared face detector singleton
         self._tracker_cls = None  # each camera gets its own Tracker instance
 
     def _init_inference(self):
-        """Lazy-initialise Detector once (model load is slow — do it on first need)."""
+        """Lazy-initialise Detector & FaceDetector once (model load is slow — do it on first need)."""
         if self._detector is not None:
             return
         try:
             from app.inference.detector import Detector
             from app.inference.tracker import Tracker
+            from app.inference.face_detector import FaceDetector
             self._detector = Detector()
+            self._face_detector = FaceDetector()
             self._tracker_cls = Tracker
             logger.info("[IngestionManager] Inference components ready.")
         except Exception as e:
             logger.warning(f"[IngestionManager] Inference unavailable (run without GPU?): {e}")
             self._detector = None
+            self._face_detector = None
             self._tracker_cls = None
 
     def get_worker(self, camera_id: str) -> Optional[CameraWorker]:
@@ -88,7 +92,7 @@ class IngestionManager:
             self._init_inference()
             if self._detector and self._tracker_cls:
                 tracker = self._tracker_cls(frame_rate=int(target_fps))
-                worker.set_inference(self._detector, tracker)
+                worker.set_inference(self._detector, tracker, face_detector=self._face_detector)
             else:
                 logger.warning(f"[{camera_id}] Inference requested but unavailable — running detection-free.")
 

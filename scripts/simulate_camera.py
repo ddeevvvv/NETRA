@@ -1,6 +1,7 @@
 import argparse
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -8,14 +9,74 @@ import time
 import cv2
 import numpy as np
 
+def find_ffmpeg_executable():
+    """Finds system ffmpeg on PATH or common macOS/Windows install locations."""
+    path = shutil.which("ffmpeg")
+    if path:
+        return path
+    
+    # Common install locations
+    local_app_data = os.environ.get("LOCALAPPDATA", "")
+    program_files = os.environ.get("ProgramFiles", "")
+    candidates = [
+        "/opt/homebrew/bin/ffmpeg",
+        "/usr/local/bin/ffmpeg",
+        os.path.join(local_app_data, "Microsoft", "WinGet", "Packages", "Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe", "ffmpeg-9.0.1-full_build", "bin", "ffmpeg.exe"),
+        os.path.join(program_files, "ffmpeg", "bin", "ffmpeg.exe"),
+        "C:\\ffmpeg\\bin\\ffmpeg.exe",
+    ]
+    for c in candidates:
+        if os.path.exists(c):
+            return c
+    return None
+
+def enumerate_avfoundation_devices():
+    """Enumerates available video capture devices on macOS via ffmpeg avfoundation."""
+    ffmpeg_bin = find_ffmpeg_executable()
+    if not ffmpeg_bin:
+        print("\n" + "!" * 80)
+        print("[CRITICAL ERROR] FFmpeg executable not found on macOS.")
+        print("!" * 80)
+        print("Please install FFmpeg via Homebrew: brew install ffmpeg\n")
+        raise RuntimeError("FFmpeg required for macOS camera enumeration.")
+    
+    res = subprocess.run(
+        [ffmpeg_bin, "-f", "avfoundation", "-list_devices", "true", "-i", ""],
+        stderr=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True
+    )
+    
+    devices = []
+    in_video_section = False
+    for line in res.stderr.splitlines():
+        if "AVFoundation video devices:" in line:
+            in_video_section = True
+            continue
+        if in_video_section and ("AVFoundation audio devices:" in line or ("[" not in line and "AVFoundation" not in line)):
+            in_video_section = False
+            continue
+        if in_video_section:
+            m = re.search(r"\]\s*\[(\d+)\]\s+(.*)", line)
+            if m:
+                idx = int(m.group(1))
+                name = m.group(2).strip()
+                devices.append((idx, name, "AVFoundation"))
+    return devices
+
 def list_available_devices():
-    """Enumerates available video capture devices (DirectShow on Windows, index testing on Unix)."""
+    """Enumerates available video capture devices (AVFoundation on macOS, DirectShow on Windows)."""
     print("\n" + "=" * 65)
     print(" IBVAP Camera Device Enumeration Helper")
     print("=" * 65)
     
     devices = []
-    if platform.system() == "Windows":
+    if platform.system() == "Darwin":
+        try:
+            devices = enumerate_avfoundation_devices()
+        except Exception as e:
+            print(f"[WARN] AVFoundation enumeration error: {e}")
+    elif platform.system() == "Windows":
         try:
             from pygrabber.dshow_graph import FilterGraph
             dshow_names = FilterGraph().get_input_devices()
@@ -24,8 +85,8 @@ def list_available_devices():
         except Exception as e:
             print(f"[WARN] pygrabber DirectShow enumeration error: {e}")
 
-    if not devices:
-        # Fallback to probing OpenCV indices 0..5
+    if not devices and platform.system() != "Darwin":
+        # Fallback to probing OpenCV indices 0..5 on non-macOS systems
         for i in range(6):
             backend = cv2.CAP_DSHOW if platform.system() == "Windows" else cv2.CAP_ANY
             cap = cv2.VideoCapture(i, backend)
@@ -43,6 +104,8 @@ def list_available_devices():
         print(f"  python scripts/simulate_camera.py --input {devices[0][0]} --stream-name cam1")
         if platform.system() == "Windows":
             print(f'  python scripts/simulate_camera.py --input "{devices[0][1]}" --stream-name cam1')
+        elif platform.system() == "Darwin":
+            print(f'  python scripts/simulate_camera.py --input {devices[0][0]} --stream-name cam1')
     else:
         print(" [!] No active video capture devices found.")
         print(" Ensure your webcam is connected and not locked by another process.")
@@ -52,8 +115,7 @@ def list_available_devices():
 
 def get_webcam_capture(input_str: str):
     """
-    Resolves input_str to an open cv2.VideoCapture instance.
-    Supports integer indices ("0"), device name strings ("USB2.0 HD UVC WebCam"), or file paths.
+    Resolves input_str to an open cv2.VideoCapture instance (for video files or Windows DirectShow).
     Raises RuntimeError loud and clear if capture fails — NO SILENT TEST PATTERNS!
     """
     is_file = False
@@ -104,9 +166,9 @@ def get_webcam_capture(input_str: str):
         print(f"[CRITICAL ERROR] Unable to open capture source: '{input_str}'")
         print("!" * 80)
         print("Possible causes:")
-        print("  1. Webcam is unplugged or disabled in Windows settings.")
+        print("  1. Webcam is unplugged or disabled in OS settings.")
         print("  2. Webcam is currently locked by another application (Zoom, Teams, Chrome, etc.).")
-        print("  3. Invalid input file path or non-existent DirectShow device name.")
+        print("  3. Invalid input file path or non-existent device name.")
         print("\nRun the device list helper to view valid connected webcams:")
         print("  python scripts/simulate_camera.py --list-devices\n")
         raise RuntimeError(f"Failed to open video source '{input_str}'")
@@ -124,28 +186,117 @@ def get_webcam_capture(input_str: str):
     print(f"[SIM] Successfully acquired stream from {resolved_description} (Frame size: {test_frame.shape[1]}x{test_frame.shape[0]})")
     return cap, is_file, resolved_description
 
-def find_ffmpeg_executable():
-    """Finds system ffmpeg on PATH or common Windows install locations."""
-    path = shutil.which("ffmpeg")
-    if path:
-        return path
-    
-    # Common Windows winget / chocolatey paths
-    local_app_data = os.environ.get("LOCALAPPDATA", "")
-    program_files = os.environ.get("ProgramFiles", "")
-    candidates = [
-        os.path.join(local_app_data, "Microsoft", "WinGet", "Packages", "Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe", "ffmpeg-9.0.1-full_build", "bin", "ffmpeg.exe"),
-        os.path.join(program_files, "ffmpeg", "bin", "ffmpeg.exe"),
-        "C:\\ffmpeg\\bin\\ffmpeg.exe",
+def stream_camera_mac(input_str: str, stream_name: str, rtsp_url: str):
+    """Streams from macOS AVFoundation webcam directly via FFmpeg into MediaMTX RTSP server."""
+    ffmpeg_bin = find_ffmpeg_executable()
+    if not ffmpeg_bin:
+        print("\n" + "!" * 80)
+        print("[CRITICAL ERROR] FFmpeg executable not found on macOS.")
+        print("!" * 80)
+        print("Please install FFmpeg via Homebrew: brew install ffmpeg\n")
+        raise RuntimeError("FFmpeg required for macOS camera streaming.")
+
+    # Resolve device index
+    devices = enumerate_avfoundation_devices()
+    dev_name = f"Device #{input_str}"
+    target_idx = None
+
+    if input_str.isdigit():
+        target_idx = int(input_str)
+        for idx, name, _ in devices:
+            if idx == target_idx:
+                dev_name = f"'{name}' (Index #{idx})"
+                break
+    else:
+        for idx, name, _ in devices:
+            if input_str.lower() in name.lower():
+                target_idx = idx
+                dev_name = f"'{name}' (Index #{idx})"
+                break
+
+    if target_idx is None:
+        print("\n" + "!" * 80)
+        print(f"[CRITICAL ERROR] Invalid AVFoundation camera input: '{input_str}'")
+        print("!" * 80)
+        print("Run the device list helper to view valid connected webcams:")
+        print("  python scripts/simulate_camera.py --list-devices\n")
+        raise RuntimeError(f"Could not resolve camera index for '{input_str}'")
+
+    description = f"macOS AVFoundation Webcam {dev_name}"
+    print(f"[SIM] Using FFmpeg executable at '{ffmpeg_bin}'")
+
+    # Command uses AVFoundation input with framerate 30, video device index, no audio
+    # piped directly to the existing RTSP publish logic
+    cmd = [
+        ffmpeg_bin,
+        "-y",
+        "-f", "avfoundation",
+        "-framerate", "30",
+        "-video_size", "1280x720",
+        "-i", f"{target_idx}:none",
+        "-c:v", "libx264",
+        "-preset", "ultrafast",
+        "-tune", "zerolatency",
+        "-pix_fmt", "yuv420p",
+        "-rtsp_transport", "tcp",
+        "-f", "rtsp",
+        rtsp_url
     ]
-    for c in candidates:
-        if os.path.exists(c):
-            return c
-    return None
+
+    while True:
+        print(f"[SIM] Launching FFmpeg pipeline: {description} -> '{rtsp_url}'")
+        proc = subprocess.Popen(
+            cmd,
+            stderr=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            text=True,
+            bufsize=1
+        )
+
+        time.sleep(1.5)
+        if proc.poll() is not None:
+            err_output = proc.stderr.read() if proc.stderr else ""
+            print(f"[SIM] FFmpeg failed or disconnected. Retrying in 2s... Error: {err_output[-200:] if err_output else 'none'}")
+            time.sleep(2)
+            continue
+
+        print(f"[SIM] Successfully acquired stream from {description}")
+
+        last_reported_frame = 0
+        frame_pattern = re.compile(r"frame=\s*(\d+)")
+        try:
+            while proc.poll() is None:
+                line = proc.stderr.readline()
+                if not line:
+                    time.sleep(0.05)
+                    continue
+                m = frame_pattern.search(line)
+                if m:
+                    frame_count = int(m.group(1))
+                    if frame_count >= last_reported_frame + 30:
+                        last_reported_frame = frame_count
+                        print(f"[SIM] Published {frame_count} live frames from {description} to '{rtsp_url}'", flush=True)
+            print(f"[SIM] Stream disconnected (exit code {proc.poll()}). Reconnecting in 2s...", flush=True)
+            time.sleep(2)
+        except KeyboardInterrupt:
+            print("\n[SIM] Stopping live camera stream...", flush=True)
+            break
+        finally:
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
 
 def stream_camera(input_str: str, stream_name: str, rtsp_url: str):
     """Main streaming engine connecting capture source to MediaMTX RTSP server."""
-    # First, acquire and validate capture source
+    # On macOS, if not a video file, use direct AVFoundation capture
+    if platform.system() == "Darwin" and not os.path.isfile(input_str):
+        stream_camera_mac(input_str, stream_name, rtsp_url)
+        return
+
+    # First, acquire and validate capture source (Windows or video file)
     cap, is_file, description = get_webcam_capture(input_str)
     
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 640
@@ -267,3 +418,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

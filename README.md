@@ -203,10 +203,46 @@ Open `http://localhost:8000/api/v1/cameras/CAM-TEST-01/debug/stream` or `http://
 
 ---
 
+## 👤 Face Detection (Stage 7 Scope Note)
+
+**Scope & Design Boundary**: Stage 7 implements real-time **face detection only** (localizing bounding boxes on human faces in sampled camera frames). Face detections are drawn with distinct blue bounding boxes on `/debug/stream` and `/debug/snapshot`. To eliminate alert flooding while preserving operational utility, `FACE_DETECTED` events (severity `INFO`) are only dispatched to the event pipeline and WebSocket stream when a face is detected within a designated `RESTRICTED` virtual-fence zone (e.g. `Z-01`). Outside of restricted zones, face detections are visually monitored but do not generate database events. In strict accordance with the project's design principles in `AGENTS.md` regarding honesty and not overclaiming capability, **face recognition, biometric feature embeddings, and facial watchlist matching are explicitly deferred to future work**.
+
+---
+
+## 🖥️ Operator Dashboard (Stage 8)
+
+The NETRA frontend is a real-time command console built in React + Vite with dark-theme styling, low-latency live MJPEG feeds, real-time WebSocket alert delivery, and operator acknowledgment workflows.
+
+### 1. Key Capabilities
+- **Live Camera Grid**: Renders live multipart JPEG video feeds directly via `/api/v1/cameras/{id}/debug/stream` with real-time FPS/health status overlays.
+- **Real-Time Alert Feed**: Connects to the backend WebSocket (`/ws/alerts`) with automatic reconnection and severity color-coding (`CRITICAL`, `HIGH`, `WARNING`, `INFO`).
+- **Human-in-the-Loop Acknowledgment**: Every alert features an interactive **Ack** button communicating with `POST /api/v1/events/{id}/acknowledge` to record operator ID and acknowledgment timestamps in PostgreSQL.
+- **Camera Health Strip**: Periodically polls `/api/v1/cameras/{id}/health` to monitor health status (`OK`, `DEGRADED`, `OFFLINE`, `FROZEN`), measured FPS vs target FPS, and variance checks.
+- **Historical Investigation Console**: Query historical alerts and audit records by camera, event type, severity, and start/end timestamp ranges.
+
+### 2. Running the Dashboard
+
+#### Option A: Local Dev Server (Fastest for Hackathon / Live Iteration)
+```bash
+cd frontend
+npm install
+npm run dev
+```
+Open **`http://localhost:5173`** in your browser. API and WebSocket calls are automatically reverse-proxied to `http://localhost:8000`.
+
+#### Option B: Docker Compose (Production Bundle)
+```bash
+docker compose up -d frontend
+```
+Open **`http://localhost:3000`** in your browser.
+
+---
+
 ## 🧪 Running Unit & Integration Tests Locally
 
 ```bash
-# Run all 26 backend unit and integration tests
-$env:PYTHONPATH="backend"; python -m pytest backend/tests -v
+# Run backend unit and integration tests inside Docker
+docker compose exec backend env PYTHONPATH=. pytest tests/test_detector.py tests/test_zone_engine.py tests/test_zone_events_integration.py tests/test_events_api.py tests/test_face_detector.py tests/test_face_events_integration.py -v
 ```
+
 
