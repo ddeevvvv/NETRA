@@ -209,7 +209,7 @@ function AlertItem({ alert, acking, onAck, onTrackPlate }) {
 
   return (
     <div
-      className={`alert-item sev-${alert.severity} ${alert.acknowledged ? 'acked' : ''} ${
+      className={`alert-item sev-${alert.severity} type-${(alert.type || '').toLowerCase()} ${alert.acknowledged ? 'acked' : ''} ${
         isExpanded ? 'expanded' : ''
       }`}
       onClick={() => setIsExpanded(!isExpanded)}
@@ -218,7 +218,10 @@ function AlertItem({ alert, acking, onAck, onTrackPlate }) {
         <div className="alert-badge-group">
           <SeverityBadge severity={alert.severity} />
           {alert.camera_id && <span className="alert-cam-tag">{alert.camera_id}</span>}
-          <span className="alert-type">{alert.type}</span>
+          {alert.type === 'NIGHT_MOVEMENT'
+            ? <span className="event-type-night-movement">🌙 {alert.type}</span>
+            : <span className="alert-type">{alert.type}</span>
+          }
         </div>
         <div className="alert-header-right">
           {snapshotUri && !isExpanded && (
