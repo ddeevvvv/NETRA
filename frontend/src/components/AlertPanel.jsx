@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
-import { connectAlertStream, acknowledgeEvent } from '../api'
+import { connectAlertStream, acknowledgeEvent, acknowledgeBulkEvents, getEvents } from '../api'
 import {
   AlertOctagon,
   AlertTriangle,
@@ -12,7 +12,8 @@ import {
   Radio,
   Clock,
   Shield,
-  Tag
+  Tag,
+  Trash2,
 } from 'lucide-react'
 
 const MAX_ALERTS = 200 // cap in-memory list
@@ -24,12 +25,29 @@ const MAX_ALERTS = 200 // cap in-memory list
  * - Expandable cards revealing full metadata & evidence snapshots
  * - Operator Acknowledge button calling backend API
  */
-export default function AlertPanel({ onStatsUpdate }) {
+export default function AlertPanel({ onStatsUpdate, onNewAlert, onTrackPlate, onAcknowledge }) {
   const [alerts, setAlerts] = useState([])
   const [wsStatus, setWsStatus] = useState('connecting')
   const [ackingId, setAckingId] = useState(null)
   const [newFlash, setNewFlash] = useState(false)
+  const [clearing, setClearing] = useState(false)
+  const [confirmClear, setConfirmClear] = useState(false)
   const bottomRef = useRef(null)
+
+  // Seed recent alerts on mount from backend so existing alerts appear immediately
+  useEffect(() => {
+    getEvents({ limit: 50 })
+      .then((data) => {
+        if (Array.isArray(data) && data.length > 0) {
+          setAlerts((prev) => {
+            const existingIds = new Set(prev.map((a) => a.id))
+            const newItems = data.filter((a) => !existingIds.has(a.id))
+            return [...prev, ...newItems].slice(0, MAX_ALERTS)
+          })
+        }
+      })
+      .catch((err) => console.error('Failed to load initial alerts:', err))
+  }, [])
 
   const handleMessage = useCallback((event) => {
     setAlerts((prev) => {
@@ -40,10 +58,12 @@ export default function AlertPanel({ onStatsUpdate }) {
       const next = [event, ...prev] // newest first
       return next.slice(0, MAX_ALERTS)
     })
+    // Forward to parent for camera grid alert highlighting
+    onNewAlert?.(event)
     // Brief flash on new real event
     setNewFlash(true)
     setTimeout(() => setNewFlash(false), 600)
-  }, [])
+  }, [onNewAlert])
 
   useEffect(() => {
     const cleanup = connectAlertStream(handleMessage, setWsStatus)
@@ -69,10 +89,32 @@ export default function AlertPanel({ onStatsUpdate }) {
             : a
         )
       )
+      onAcknowledge?.(1)
     } catch (err) {
       console.error('Acknowledge failed:', err)
     } finally {
       setAckingId(null)
+    }
+  }
+
+  const handleClearAll = async () => {
+    if (!confirmClear) {
+      // First click: arm the confirm state, auto-reset after 3 s
+      setConfirmClear(true)
+      setTimeout(() => setConfirmClear(false), 3000)
+      return
+    }
+    setClearing(true)
+    setConfirmClear(false)
+    try {
+      const unackedBefore = alerts.filter((a) => !a.acknowledged).length
+      await acknowledgeBulkEvents({})
+      setAlerts((prev) => prev.map((a) => ({ ...a, acknowledged: true, acknowledged_by: 'operator' })))
+      onAcknowledge?.(unackedBefore || 1)
+    } catch (err) {
+      console.error('Bulk acknowledge failed:', err)
+    } finally {
+      setClearing(false)
     }
   }
 
@@ -101,6 +143,18 @@ export default function AlertPanel({ onStatsUpdate }) {
           <span>{wsLabel[wsStatus] ?? wsStatus}</span>
           <span className="alert-count">({alerts.length})</span>
         </div>
+        {alerts.some((a) => !a.acknowledged) && (
+          <button
+            type="button"
+            className={`btn-clear-all ${confirmClear ? 'btn-clear-confirm' : ''}`}
+            onClick={handleClearAll}
+            disabled={clearing}
+            title={confirmClear ? 'Click again to confirm clearing all alerts' : 'Bulk-acknowledge all active alerts'}
+          >
+            <Trash2 size={11} />
+            <span>{clearing ? 'Clearing…' : confirmClear ? 'Confirm?' : 'Clear All'}</span>
+          </button>
+        )}
       </div>
 
       <div className="alert-list">
@@ -127,6 +181,7 @@ export default function AlertPanel({ onStatsUpdate }) {
             alert={alert}
             acking={ackingId === alert.id}
             onAck={handleAck}
+            onTrackPlate={onTrackPlate}
           />
         ))}
         <div ref={bottomRef} />
@@ -135,7 +190,7 @@ export default function AlertPanel({ onStatsUpdate }) {
   )
 }
 
-function AlertItem({ alert, acking, onAck }) {
+function AlertItem({ alert, acking, onAck, onTrackPlate }) {
   const [isExpanded, setIsExpanded] = useState(false)
 
   const ts = new Date(alert.timestamp)
@@ -144,6 +199,7 @@ function AlertItem({ alert, acking, onAck }) {
 
   const meta = alert.metadata || alert.event_metadata || {}
   const snapshotUri = alert.evidence?.snapshot_uri
+  const detectedPlate = meta.license_plate || meta.plate_text || meta.plate
 
   const metaParts = []
   if (alert.camera_id) metaParts.push(alert.camera_id)
@@ -161,6 +217,7 @@ function AlertItem({ alert, acking, onAck }) {
       <div className="alert-header-row">
         <div className="alert-badge-group">
           <SeverityBadge severity={alert.severity} />
+          {alert.camera_id && <span className="alert-cam-tag">{alert.camera_id}</span>}
           <span className="alert-type">{alert.type}</span>
         </div>
         <div className="alert-header-right">
@@ -235,6 +292,21 @@ function AlertItem({ alert, acking, onAck }) {
       )}
 
       <div className="alert-footer-row">
+        {detectedPlate && (
+          <button
+            type="button"
+            className="btn-track-plate-shortcut"
+            onClick={(e) => {
+              e.stopPropagation()
+              onTrackPlate?.(detectedPlate)
+            }}
+            title={`Track movement history for plate ${detectedPlate}`}
+          >
+            <Tag size={11} />
+            <span>Track Plate ({detectedPlate})</span>
+          </button>
+        )}
+
         {alert.acknowledged ? (
           <span className="acked-label">
             <Check size={11} className="ack-check-icon" />

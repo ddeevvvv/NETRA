@@ -56,6 +56,9 @@ export default function ANPRPanel({ cameras }) {
 
         {cameras.length > 1 && (
           <select
+            id="anpr-cam-select"
+            name="anpr_cam_select"
+            aria-label="Filter ANPR activity by camera"
             className="anpr-cam-select"
             value={selectedCamId}
             onChange={(e) => setSelectedCamId(e.target.value)}

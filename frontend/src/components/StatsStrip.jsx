@@ -72,15 +72,16 @@ export default function StatsStrip({
       value: unackedCount,
       icon: AlertOctagon,
       tag: unackedCount > 0 ? 'ACTION REQ' : 'NOMINAL',
-      tagType: unackedCount > 0 ? 'purple' : 'green',
+      tagType: unackedCount > 0 ? 'red' : 'green',
       pulse: unackedCount > 0,
+      isUrgent: unackedCount > 0,
     },
   ]
 
   return (
     <div className="stats-strip">
-      {stats.map(({ id, label, value, icon: Icon, tag, tagType, pulse }) => (
-        <div key={id} id={id} className="stat-card">
+      {stats.map(({ id, label, value, icon: Icon, tag, tagType, pulse, isUrgent }) => (
+        <div key={id} id={id} className={`stat-card ${isUrgent ? 'stat-card-urgent' : ''}`}>
           <div className="stat-icon-wrap">
             <Icon size={15} className={`stat-icon ${pulse ? 'pulse-icon' : ''}`} />
           </div>
