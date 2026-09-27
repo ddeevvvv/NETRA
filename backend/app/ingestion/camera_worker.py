@@ -258,6 +258,17 @@ class CameraWorker:
         self.recent_anpr_crops: List[Dict[str, Any]] = []
         self._last_watchlist_sync_time = 0.0
 
+        # Night-mode / NIGHT_MOVEMENT detection state
+        self._night_mode_active: bool = False
+        self._last_night_event_time: float = 0.0
+        self._night_event_debounce: float = float(os.environ.get("NIGHT_MOVEMENT_DEBOUNCE", 10.0))
+        self._night_brightness_threshold: float = float(os.environ.get("NIGHT_BRIGHTNESS_THRESHOLD", 60.0))
+        self._night_movement_enabled: bool = os.environ.get("NIGHT_MOVEMENT_ENABLED", "true").lower() == "true"
+        self._night_motion_threshold: float = 3.0  # mean abs-diff to count as motion in dark scene
+
+        # 4-K cap: downsample frames wider than this before YOLO inference
+        self._inference_max_width: int = int(os.environ.get("INFERENCE_MAX_WIDTH", 960))
+
         # Persistent HTTP client for connection pooling
         self._http_client: Optional[httpx.AsyncClient] = None
 
@@ -550,9 +561,54 @@ class CameraWorker:
                             condition="RECOVERED",
                             metadata_extra={"restored_issue": "FROZEN"}
                         )
+            prev_gray_snapshot = self._prev_frame_gray  # capture before overwrite
             self._prev_frame_gray = gray
 
+            # ── 6b. Night Mode & NIGHT_MOVEMENT detection ─────────────────────
+            mean_brightness = float(np.mean(gray))
+            self._night_mode_active = mean_brightness < self._night_brightness_threshold
+
+            if (
+                self._night_movement_enabled
+                and self._night_mode_active
+                and prev_gray_snapshot is not None
+            ):
+                diff_nm = cv2.absdiff(gray, prev_gray_snapshot)
+                motion_score = float(np.mean(diff_nm))
+                if (
+                    motion_score > self._night_motion_threshold
+                    and (now - self._last_night_event_time) >= self._night_event_debounce
+                ):
+                    self._last_night_event_time = now
+                    asyncio.create_task(self._post_event({
+                        "camera_id": self.camera_id,
+                        "type": "NIGHT_MOVEMENT",
+                        "severity": "HIGH",
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "object_type": "motion",
+                        "track_id": None,
+                        "confidence": round(min(1.0, motion_score / 20.0), 3),
+                        "zone_id": None,
+                        "evidence": {},
+                        "metadata": {
+                            "rule_name": "Night Movement Detected",
+                            "mean_brightness": round(mean_brightness, 1),
+                            "motion_score": round(motion_score, 3),
+                            "brightness_threshold": self._night_brightness_threshold,
+                        },
+                    }))
+                    logger.info(
+                        f"[{self.camera_id}] EMIT NIGHT_MOVEMENT (HIGH) — "
+                        f"brightness={mean_brightness:.1f} motion={motion_score:.3f}"
+                    )
+
             # ── 7. AI Inference, Tracking, Zones & ANPR ──────────────────────
+            # Downscale 4K+ frames before YOLO to avoid memory/perf issues.
+            inf_frame = frame
+            if frame.shape[1] > self._inference_max_width:
+                scale = self._inference_max_width / frame.shape[1]
+                inf_frame = cv2.resize(frame, (self._inference_max_width, int(frame.shape[0] * scale)), interpolation=cv2.INTER_AREA)
+
             annotated = frame.copy()
             detections = []
             active_zone_map: Dict[int, List[Dict[str, Any]]] = {}
@@ -561,9 +617,9 @@ class CameraWorker:
                 t0 = time.perf_counter()
                 if self._inference_lock is not None:
                     async with self._inference_lock:
-                        raw_detections = await asyncio.to_thread(self._detector.detect, frame)
+                        raw_detections = await asyncio.to_thread(self._detector.detect, inf_frame)
                 else:
-                    raw_detections = await asyncio.to_thread(self._detector.detect, frame)
+                    raw_detections = await asyncio.to_thread(self._detector.detect, inf_frame)
                 tracks = await asyncio.to_thread(self._tracker.update, raw_detections, frame)
                 latency_ms = (time.perf_counter() - t0) * 1000
 

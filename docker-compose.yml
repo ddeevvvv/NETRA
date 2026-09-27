@@ -49,12 +49,15 @@ services:
     restart: always
     volumes:
       - ./backend:/app
+      - ./scripts/camera_feeds:/feeds:ro
     ports:
       - "8000:8000"
     environment:
       - DATABASE_URL=postgresql://ibvap_user:ibvap_password@postgres:5432/ibvap_db
       - REDIS_URL=redis://redis:6379/0
       - ENVIRONMENT=production
+      - NIGHT_MOVEMENT_ENABLED=true
+      - NIGHT_BRIGHTNESS_THRESHOLD=60
     depends_on:
       postgres:
         condition: service_healthy
