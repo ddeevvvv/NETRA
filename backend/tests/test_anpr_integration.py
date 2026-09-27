@@ -108,3 +108,19 @@ def test_anpr_watchlist_pipeline_integration(client, db_session):
     saved3 = db_session.query(Event).filter(Event.id == evt3_id).first()
     assert saved3.type == "ANPR_READ"
     assert saved3.severity == "INFO"
+
+    # 5. Test Vehicle Sightings API (/api/v1/vehicles/{plate}/sightings)
+    # Test normalized lookup matching ka-05-nb-4912 to KA05NB4912
+    sight_resp = client.get("/api/v1/vehicles/ka-05%20nb-4912/sightings")
+    assert sight_resp.status_code == 200
+    sightings = sight_resp.json()
+    assert len(sightings) == 1
+    assert sightings[0]["camera_id"] == "CAM-TEST-01"
+    assert sightings[0]["plate_text"] == "KA05NB4912"
+    assert sightings[0]["watchlist_match"] is True
+
+    # Test unknown plate returns empty list (200 OK)
+    empty_resp = client.get("/api/v1/vehicles/UNKNOWN9999/sightings")
+    assert empty_resp.status_code == 200
+    assert empty_resp.json() == []
+
