@@ -40,6 +40,7 @@ export default function CameraGrid({
   const [drawPoints, setDrawPoints] = useState([])
   const [modalState, setModalState] = useState({ isOpen: false, mode: 'create', zone: null, polygonCoords: null, cameraId: '' })
   const [streamRefreshKeys, setStreamRefreshKeys] = useState({})
+  const [selectedCamId, setSelectedCamId] = useState(null)
 
   // Handle external redraw trigger from ZonesList
   useEffect(() => {
@@ -103,9 +104,47 @@ export default function CameraGrid({
     )
   }
 
+  const selectedCam = cameras.find((c) => c.id === selectedCamId) || null
+  const gridClass = cameras.length >= 9 ? 'camera-grid camera-grid-9' : 'camera-grid'
+
   return (
     <>
-      <div className="camera-grid">
+      {/* Preview panel — appears when a tile is clicked */}
+      {selectedCam && (
+        <div className="camera-preview-panel">
+          <div className="camera-preview-header">
+            <span className="camera-preview-title">
+              {selectedCam.name || selectedCam.id}
+            </span>
+            <button
+              className="camera-preview-close"
+              onClick={() => setSelectedCamId(null)}
+              aria-label="Close preview"
+            >
+              ×
+            </button>
+          </div>
+          <div className="camera-preview-feed">
+            <img
+              src={`/api/v1/cameras/${selectedCam.id}/stream?key=${streamRefreshKeys[selectedCam.id] || 0}`}
+              alt={`Preview: ${selectedCam.name || selectedCam.id}`}
+              className="camera-preview-img"
+              onError={(e) => { e.currentTarget.style.display = 'none' }}
+            />
+          </div>
+          <div className="camera-preview-meta">
+            <span>{selectedCam.id}</span>
+            <span>•</span>
+            <span>{selectedCam.location || '—'}</span>
+            <span>•</span>
+            <span style={{ color: healthMap[selectedCam.id]?.is_connected ? 'var(--netra-cyan)' : 'var(--netra-danger)' }}>
+              {healthMap[selectedCam.id]?.connection_state ?? 'OFFLINE'}
+            </span>
+          </div>
+        </div>
+      )}
+
+      <div className={gridClass}>
         {cameras.map((cam) => (
           <CameraCard
             key={cam.id}
@@ -119,6 +158,8 @@ export default function CameraGrid({
             onStartDraw={() => handleStartDraw(cam.id)}
             onCancelDraw={handleCancelDraw}
             onFinishDraw={handleFinishDraw}
+            isSelected={selectedCamId === cam.id}
+            onSelect={() => setSelectedCamId(cam.id === selectedCamId ? null : cam.id)}
           />
         ))}
       </div>
@@ -148,6 +189,8 @@ function CameraCard({
   onStartDraw,
   onCancelDraw,
   onFinishDraw,
+  isSelected = false,
+  onSelect,
 }) {
   const [streamError, setStreamError] = useState(false)
   const [localRetryKey, setLocalRetryKey] = useState(0)
@@ -223,7 +266,7 @@ function CameraCard({
     <motion.div
       className={`camera-card card-${status} ${isDrawing ? 'card-drawing-mode' : ''} ${
         alertHighlight ? `alert-active alert-${sevLower}` : ''
-      }`}
+      } ${isSelected ? 'card-selected-preview' : ''}`}
       animate={
         alertHighlight
           ? {
@@ -269,6 +312,15 @@ function CameraCard({
           </div>
         </div>
         <div className="camera-header-actions">
+          <button
+            type="button"
+            className="btn-preview-expand"
+            onClick={(e) => { e.stopPropagation(); onSelect?.() }}
+            title={isSelected ? 'Close preview' : 'Open full preview'}
+            aria-label={isSelected ? 'Close preview' : 'Open full preview'}
+          >
+            {isSelected ? <X size={11} /> : <RotateCcw size={11} style={{ transform: 'rotate(45deg)' }} />}
+          </button>
           <button
             type="button"
             className={`btn-add-zone ${isDrawing ? 'btn-drawing-active' : ''}`}
