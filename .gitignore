@@ -8,3 +8,4 @@ ibvap.db
 .env
 snap_*.jpg
 *.log
+evidence_exports/
