@@ -11,6 +11,7 @@ class Camera(Base):
     rtsp_url = Column(String, nullable=False)
     location = Column(String, nullable=True)
     status = Column(String, default="ONLINE")
+    last_seen_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
     zones = relationship("Zone", back_populates="camera", cascade="all, delete-orphan")

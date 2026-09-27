@@ -10,6 +10,7 @@ class CameraCreate(BaseModel):
     status: Optional[str] = "ONLINE"
 
 class CameraResponse(CameraCreate):
+    last_seen_at: Optional[datetime] = None
     created_at: datetime
 
     model_config = ConfigDict(from_attributes=True)

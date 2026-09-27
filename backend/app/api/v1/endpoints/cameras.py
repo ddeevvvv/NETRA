@@ -60,7 +60,11 @@ def get_camera(camera_id: str, db: Session = Depends(get_db)):
 
 
 @router.post("/{camera_id}/start", response_model=CameraResponse)
-async def start_camera_endpoint(camera_id: str, db: Session = Depends(get_db)):
+async def start_camera_endpoint(
+    camera_id: str,
+    target_fps: float = 5.0,
+    db: Session = Depends(get_db),
+):
     camera = db.query(Camera).filter(Camera.id == camera_id).first()
     if not camera:
         raise HTTPException(
@@ -70,13 +74,18 @@ async def start_camera_endpoint(camera_id: str, db: Session = Depends(get_db)):
     await ingestion_manager.start_camera(
         camera_id=camera.id,
         rtsp_url=camera.rtsp_url,
+        target_fps=target_fps,
         enable_inference=True
     )
     return camera
 
 
 @router.post("/{camera_id}/restart", response_model=CameraResponse)
-async def restart_camera_endpoint(camera_id: str, db: Session = Depends(get_db)):
+async def restart_camera_endpoint(
+    camera_id: str,
+    target_fps: float = 5.0,
+    db: Session = Depends(get_db),
+):
     """Force-recycle the ingestion worker even if it reports is_running=True.
     Use this when health shows is_connected=True but last_frame_at is stale (zombie worker)."""
     camera = db.query(Camera).filter(Camera.id == camera_id).first()
@@ -88,14 +97,28 @@ async def restart_camera_endpoint(camera_id: str, db: Session = Depends(get_db))
     await ingestion_manager.restart_camera(
         camera_id=camera.id,
         rtsp_url=camera.rtsp_url,
+        target_fps=target_fps,
         enable_inference=True
     )
     return camera
 
 
+@router.post("/{camera_id}/stop", response_model=CameraResponse)
+async def stop_camera_endpoint(camera_id: str, db: Session = Depends(get_db)):
+    """Stop the ingestion worker for the camera."""
+    camera = db.query(Camera).filter(Camera.id == camera_id).first()
+    if not camera:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Camera '{camera_id}' not found"
+        )
+    await ingestion_manager.stop_camera(camera_id=camera.id)
+    return camera
+
+
 @router.get("/{camera_id}/health")
 async def get_camera_health(camera_id: str, db: Session = Depends(get_db)):
-    """Returns camera health status, last_frame_at, and measured_fps."""
+    """Returns camera health status, last_frame_at, connection_state, and measured_fps."""
     worker = ingestion_manager.get_worker(camera_id)
     if not worker or not worker.is_running:
         camera = db.query(Camera).filter(Camera.id == camera_id).first()
@@ -109,7 +132,16 @@ async def get_camera_health(camera_id: str, db: Session = Depends(get_db)):
             rtsp_url=camera.rtsp_url,
             enable_inference=True
         )
-    return worker.get_health_status()
+    health = worker.get_health_status()
+    # Sync with DB if last_seen_at is known
+    cam = db.query(Camera).filter(Camera.id == camera_id).first()
+    if cam:
+        if worker.last_seen_at and cam.last_seen_at != worker.last_seen_at:
+            cam.last_seen_at = worker.last_seen_at
+            db.commit()
+        elif not health.get("last_seen_at") and cam.last_seen_at:
+            health["last_seen_at"] = cam.last_seen_at.isoformat()
+    return health
 
 
 # ── Debug Endpoints ──────────────────────────────────────────────────────────

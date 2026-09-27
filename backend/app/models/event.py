@@ -23,6 +23,7 @@ class Event(Base):
     event_metadata = Column(JSON, nullable=False, default=dict)
 
     # Human-in-the-loop acknowledgment fields (Design principle)
+    requires_acknowledgment = Column(Boolean, default=True, nullable=False, index=True)
     acknowledged = Column(Boolean, default=False, nullable=False)
     acknowledged_at = Column(DateTime(timezone=True), nullable=True)
     acknowledged_by = Column(String, nullable=True)
