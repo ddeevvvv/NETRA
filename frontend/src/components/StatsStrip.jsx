@@ -19,11 +19,16 @@ export default function StatsStrip({
   unackedCount = 0,
   zoneCount = 0,
 }) {
-  // Cameras ONLINE = those whose health status is "ok"
+  // Cameras ONLINE = those that are connected and not OFFLINE
   const onlineCount = cameras.filter((c) => {
     const h = healthMap[c.id]
     if (!h) return false
-    return h.is_connected && !h.is_frozen && !h.is_low_fps
+    return Boolean(h.is_connected && h.connection_state !== 'OFFLINE')
+  }).length
+
+  const degradedCount = cameras.filter((c) => {
+    const h = healthMap[c.id]
+    return h && (h.is_low_fps || h.is_frozen || h.connection_state === 'DEGRADED')
   }).length
 
   // Alerts TODAY — filter by today's date (local)
@@ -44,9 +49,9 @@ export default function StatsStrip({
       label: 'Cameras Online',
       value: `${onlineCount} / ${cameras.length}`,
       icon: Camera,
-      tag: isAllOnline ? 'ONLINE' : cameras.length === 0 ? 'OFFLINE' : 'DEGRADED',
-      tagType: isAllOnline ? 'green' : cameras.length === 0 ? 'dim' : 'amber',
-      pulse: isAllOnline,
+      tag: isAllOnline ? (degradedCount > 0 ? 'DEGRADED' : 'ONLINE') : cameras.length === 0 ? 'OFFLINE' : 'DEGRADED',
+      tagType: isAllOnline ? (degradedCount > 0 ? 'amber' : 'green') : cameras.length === 0 ? 'dim' : 'amber',
+      pulse: isAllOnline && degradedCount === 0,
     },
     {
       id: 'stat-active-zones',
