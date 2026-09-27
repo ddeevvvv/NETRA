@@ -85,7 +85,7 @@ class ZoneEngine:
         self,
         camera_id: str,
         tracks: List[Dict[str, Any]],
-        frame_shape: Tuple[int, int, ...],
+        frame_shape: Tuple[int, ...],
         zones: List[Dict[str, Any]],
         current_time: Optional[float] = None,
     ) -> Tuple[List[Dict[str, Any]], Dict[int, List[Dict[str, Any]]]]:

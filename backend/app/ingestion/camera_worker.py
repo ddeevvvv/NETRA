@@ -4,7 +4,7 @@ import base64
 import logging
 import time
 from datetime import datetime, timezone
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple
 import cv2
 import httpx
 import numpy as np
@@ -77,6 +77,117 @@ def _draw_pill_badge(img, text: str, x: int, y: int, accent_color: tuple, font_s
     )
 
 
+def _fetch_frame(cap: cv2.VideoCapture) -> Tuple[bool, Optional[np.ndarray]]:
+    """Fetches the freshest frame from VideoCapture.
+    Drains at most 1 stale frame if present without stalling the pipeline
+    waiting for multiple future frame capture intervals.
+    """
+    try:
+        # At most 1 discard grab to flush any single stale buffered frame
+        cap.grab()
+        ret, frame = cap.retrieve()
+        if not ret or frame is None:
+            ret, frame = cap.read()
+        return ret, frame
+    except Exception:
+        return False, None
+
+
+def _render_annotations(
+    frame: np.ndarray,
+    zones: List[Dict[str, Any]],
+    detections: List[Dict[str, Any]],
+    active_zone_map: Dict[int, List[Dict[str, Any]]],
+    anpr_state: Dict[int, Dict[str, Any]],
+    latest_face_detections: List[Dict[str, Any]],
+) -> np.ndarray:
+    """Renders zone polygons, bounding boxes, labels, ANPR badges, and face tags.
+    Executed in a worker thread to keep the asyncio event loop unblocked.
+    """
+    annotated = frame.copy()
+    h, w = frame.shape[:2]
+    overlay = annotated.copy()
+    has_zones = False
+
+    for z in zones:
+        coords = z.get("polygon_coords", [])
+        if not coords or len(coords) < 3:
+            continue
+
+        has_zones = True
+        pts = (np.array(coords, dtype=np.float32) * np.array([w, h])).astype(np.int32)
+        pts = pts.reshape((-1, 1, 2))
+
+        is_restricted = (z.get("restriction_level", "RESTRICTED").upper() == "RESTRICTED")
+        poly_color = (0, 0, 220) if is_restricted else (220, 200, 0)
+
+        cv2.fillPoly(overlay, [pts], poly_color)
+        cv2.polylines(annotated, [pts], isClosed=True, color=poly_color, thickness=1)
+
+        lbl_x = int(pts[0][0][0])
+        lbl_y = int(pts[0][0][1])
+        zone_label = f"[{z.get('restriction_level', 'RESTRICTED')}] {z.get('id', '')}: {z.get('name', '')}"
+        _draw_pill_badge(annotated, zone_label, lbl_x, lbl_y, poly_color, font_scale=0.38)
+
+    if has_zones:
+        cv2.addWeighted(overlay, 0.25, annotated, 0.75, 0, annotated)
+
+    # Draw bounding boxes, track labels, and ANPR plate overlays
+    for t in detections:
+        tid = t["track_id"]
+        x1, y1, x2, y2 = int(t["bbox"][0]), int(t["bbox"][1]), int(t["bbox"][2]), int(t["bbox"][3])
+        obj_class = t["object_class"]
+        conf = t["confidence"]
+
+        zones_inside = active_zone_map.get(tid, [])
+        is_in_restricted = any(z.get("restriction_level", "RESTRICTED").upper() == "RESTRICTED" for z in zones_inside)
+        is_in_monitored = any(z.get("restriction_level", "RESTRICTED").upper() == "MONITORED" for z in zones_inside)
+
+        # ANPR read state
+        anpr_info = anpr_state.get(tid, {})
+        plate_text = anpr_info.get("plate")
+        is_plate_match = anpr_info.get("is_match", False)
+        plate_list_type = anpr_info.get("list_type")
+
+        if is_in_restricted or (is_plate_match and plate_list_type == "BLACKLIST"):
+            box_color = (0, 0, 255)  # Bright RED for restricted intrusion or blacklist match
+            status_tag = " [INTRUSION]" if is_in_restricted else " [BLACKLIST]"
+        elif is_in_monitored:
+            box_color = (0, 255, 255)  # Yellow for monitored zone
+            status_tag = " [MONITORED]"
+        elif is_plate_match and plate_list_type == "WHITELIST":
+            box_color = (0, 200, 0)
+            status_tag = " [WHITELIST]"
+        else:
+            box_color = (0, 255, 0) if obj_class == "person" else (255, 128, 0)
+            status_tag = ""
+
+        plate_tag = f" · {plate_text}" if plate_text else ""
+        label = f"#{tid} {obj_class} {int(conf * 100)}%{status_tag}{plate_tag}"
+
+        # 1.5px / 1px crisp bounding box
+        cv2.rectangle(annotated, (x1, y1), (x2, y2), box_color, 1)
+        # Floating pill badge with Slate-900 backdrop and accent dot
+        _draw_pill_badge(annotated, label, x1, y1, box_color, font_scale=0.38)
+
+    # Draw face detection bounding boxes (1px stroke + non-overlapping pill badge below)
+    for f in latest_face_detections:
+        fx1, fy1, fx2, fy2 = int(f["bbox"][0]), int(f["bbox"][1]), int(f["bbox"][2]), int(f["bbox"][3])
+        fconf = f["confidence"]
+        face_color = (255, 180, 0)  # Defense cyan/blue in BGR
+        cv2.rectangle(annotated, (fx1, fy1), (fx2, fy2), face_color, 1)
+        _draw_pill_badge(
+            annotated,
+            f"FACE {int(fconf * 100)}%",
+            fx1,
+            fy2 + 16,
+            face_color,
+            font_scale=0.34,
+        )
+
+    return annotated
+
+
 class CameraWorker:
     def __init__(
         self,
@@ -106,6 +217,10 @@ class CameraWorker:
         self.is_frozen = False
         self.is_low_fps = False
 
+        self.connection_state: str = "OFFLINE"  # ONLINE, DEGRADED, RECONNECTING, OFFLINE
+        self.reconnect_attempt_count: int = 0
+        self.max_reconnect_retries: int = 10
+        self.last_seen_at: Optional[datetime] = None
         self.last_frame_at: Optional[datetime] = None
         self.measured_fps: float = 0.0
 
@@ -130,6 +245,7 @@ class CameraWorker:
         self._tracker = None
         self._anpr: Optional[ANPRProcessor] = None
         self._face_detector: Optional[FaceDetector] = None
+        self._inference_lock: Optional[asyncio.Lock] = None
 
         # Zone Analytics Engine & Zones
         self._zone_engine = ZoneEngine(temporal_confirmation_frames=2, track_timeout_seconds=3.0)
@@ -142,12 +258,23 @@ class CameraWorker:
         self.recent_anpr_crops: List[Dict[str, Any]] = []
         self._last_watchlist_sync_time = 0.0
 
-    def set_inference(self, detector, tracker, anpr: Optional[ANPRProcessor] = None, face_detector: Optional[FaceDetector] = None):
-        """Attach Detector + Tracker + ANPR + FaceDetector after construction."""
+        # Persistent HTTP client for connection pooling
+        self._http_client: Optional[httpx.AsyncClient] = None
+
+    def set_inference(
+        self,
+        detector,
+        tracker,
+        anpr: Optional[ANPRProcessor] = None,
+        face_detector: Optional[FaceDetector] = None,
+        inference_lock: Optional[asyncio.Lock] = None,
+    ):
+        """Attach Detector + Tracker + ANPR + FaceDetector + Inference Lock after construction."""
         self._detector = detector
         self._tracker = tracker
         self._anpr = anpr if anpr is not None else ANPRProcessor()
         self._face_detector = face_detector
+        self._inference_lock = inference_lock
 
     async def reload_zones(self):
         """Loads zones associated with this camera from database."""
@@ -196,19 +323,25 @@ class CameraWorker:
         except Exception as e:
             logger.warning(f"[{self.camera_id}] Failed to reload watchlist: {e}")
 
+    def _get_http_client(self) -> httpx.AsyncClient:
+        """Returns or creates a shared httpx.AsyncClient for connection reuse."""
+        if self._http_client is None or self._http_client.is_closed:
+            self._http_client = httpx.AsyncClient(timeout=3.0)
+        return self._http_client
+
     async def _post_event(self, payload: Dict[str, Any]):
         """POSTs an alert/event to /api/v1/events adhering strictly to the event schema."""
         endpoint = f"{self.api_base_url}/api/v1/events"
         try:
-            async with httpx.AsyncClient(timeout=3.0) as client:
-                resp = await client.post(endpoint, json=payload)
-                if resp.status_code == 201:
-                    logger.info(
-                        f"[{self.camera_id}] Posted {payload.get('type')} event: "
-                        f"track={payload.get('track_id')} ({payload.get('severity')})"
-                    )
-                else:
-                    logger.warning(f"[{self.camera_id}] Failed to post event: {resp.status_code} - {resp.text}")
+            client = self._get_http_client()
+            resp = await client.post(endpoint, json=payload)
+            if resp.status_code == 201:
+                logger.info(
+                    f"[{self.camera_id}] Posted {payload.get('type')} event: "
+                    f"track={payload.get('track_id')} ({payload.get('severity')})"
+                )
+            else:
+                logger.warning(f"[{self.camera_id}] Failed to post event: {resp.status_code} - {resp.text}")
         except Exception as e:
             logger.debug(f"[{self.camera_id}] Error posting event: {e}")
 
@@ -242,6 +375,9 @@ class CameraWorker:
             "is_connected": self.is_connected,
             "is_frozen": self.is_frozen,
             "is_low_fps": self.is_low_fps,
+            "connection_state": self.connection_state,
+            "reconnect_attempt_count": self.reconnect_attempt_count,
+            "last_seen_at": self.last_seen_at.isoformat() if self.last_seen_at else None,
             "measured_fps": round(self.measured_fps, 2),
             "target_fps": self.target_fps,
             "last_frame_at": self.last_frame_at.isoformat() if self.last_frame_at else None,
@@ -274,6 +410,12 @@ class CameraWorker:
         while self.is_running:
             # ── 1. Ensure VideoCapture is open ────────────────────────────────
             if cap is None or not cap.isOpened():
+                self.reconnect_attempt_count += 1
+                if self.reconnect_attempt_count < self.max_reconnect_retries:
+                    self.connection_state = "RECONNECTING"
+                else:
+                    self.connection_state = "OFFLINE"
+
                 os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
                 source = int(self.rtsp_url) if self.rtsp_url.isdigit() else self.rtsp_url
                 if isinstance(source, str) and ("localhost:8554" in source or "127.0.0.1:8554" in source):
@@ -296,37 +438,41 @@ class CameraWorker:
                                 condition="DISCONNECTED",
                                 metadata_extra={"details": "RTSP stream connection failed"}
                             )
-                    await asyncio.sleep(2.0)
+                    await asyncio.sleep(min(1.0, max(0.05, self.disconnect_timeout_seconds / 2.0)))
                     continue
 
-            # ── 2. Grab-and-discard buffer drain ──────────────────────────────
-            grabbed = False
-            consecutive_grab_fails = 0
-            for _ in range(8):
-                if cap.grab():
-                    grabbed = True
-                    consecutive_grab_fails = 0
-                else:
-                    consecutive_grab_fails += 1
-                    if consecutive_grab_fails >= 3:
-                        break
-
-            if grabbed:
-                ret, frame = cap.retrieve()
-            else:
-                ret, frame = cap.read()
+            # ── 2. Frame acquisition (offloaded to thread, 1-frame drain) ─────
+            ret, frame = await asyncio.to_thread(_fetch_frame, cap)
 
             now = time.time()
 
             if not ret or frame is None:
                 if cap.get(cv2.CAP_PROP_FRAME_COUNT) > 0:
                     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                if now - self._last_successful_frame_time > self.disconnect_timeout_seconds:
+                    self.is_connected = False
+                    self.reconnect_attempt_count += 1
+                    if self.reconnect_attempt_count < self.max_reconnect_retries:
+                        self.connection_state = "RECONNECTING"
+                    else:
+                        self.connection_state = "OFFLINE"
+                    if cap is not None:
+                        cap.release()
+                        cap = None
                 await asyncio.sleep(0.01)
                 continue
 
             # ── 3. Mark connection alive ──────────────────────────────────────
             self.is_connected = True
+            self.reconnect_attempt_count = 0
             self._last_successful_frame_time = now
+            self.last_seen_at = datetime.now(timezone.utc)
+            self.last_frame_at = self.last_seen_at
+            if self.is_frozen or self.is_low_fps:
+                self.connection_state = "DEGRADED"
+            else:
+                self.connection_state = "ONLINE"
+
             if "DISCONNECTED" in self._active_failures:
                 self._active_failures.remove("DISCONNECTED")
                 await self._post_health_event(
@@ -413,12 +559,17 @@ class CameraWorker:
 
             if self.enable_inference and self._detector is not None and self._tracker is not None:
                 t0 = time.perf_counter()
-                raw_detections = self._detector.detect(frame)
-                tracks = self._tracker.update(raw_detections, frame)
+                if self._inference_lock is not None:
+                    async with self._inference_lock:
+                        raw_detections = await asyncio.to_thread(self._detector.detect, frame)
+                else:
+                    raw_detections = await asyncio.to_thread(self._detector.detect, frame)
+                tracks = await asyncio.to_thread(self._tracker.update, raw_detections, frame)
                 latency_ms = (time.perf_counter() - t0) * 1000
 
-                # 7a. Zone Analytics Engine
-                zone_events, active_zone_map = self._zone_engine.process_frame(
+                # 7a. Zone Analytics Engine (offloaded to thread)
+                zone_events, active_zone_map = await asyncio.to_thread(
+                    self._zone_engine.process_frame,
                     camera_id=self.camera_id,
                     tracks=tracks,
                     frame_shape=frame.shape,
@@ -447,7 +598,11 @@ class CameraWorker:
 
                             if (x2 - x1) >= 30 and (y2 - y1) >= 20:
                                 crop = frame[y1:y2, x1:x2]
-                                anpr_res = self._anpr.process(crop)
+                                if self._inference_lock is not None:
+                                    async with self._inference_lock:
+                                        anpr_res = await asyncio.to_thread(self._anpr.process, crop)
+                                else:
+                                    anpr_res = await asyncio.to_thread(self._anpr.process, crop)
 
                                 # Base64 encode crop for debug anpr-crops endpoint
                                 ok, crop_buf = cv2.imencode(".jpg", crop, [cv2.IMWRITE_JPEG_QUALITY, 75])
@@ -499,6 +654,7 @@ class CameraWorker:
                                             "evidence": {},
                                             "metadata": {
                                                 "license_plate": plate,
+                                                "plate_text": plate,
                                                 "list_type": list_type,
                                                 "notes": wl_entry.get("notes"),
                                                 "ocr_confidence": ocr_conf,
@@ -527,6 +683,7 @@ class CameraWorker:
                                             "evidence": {},
                                             "metadata": {
                                                 "license_plate": plate,
+                                                "plate_text": plate,
                                                 "ocr_confidence": ocr_conf,
                                                 "raw_ocr": anpr_res.get("raw_text"),
                                                 "rule_name": "Vehicle Plate Read",
@@ -545,7 +702,11 @@ class CameraWorker:
                 # 7c. Face Detection & Restricted Zone Alerting
                 if self._face_detector is not None:
                     try:
-                        detected_faces = self._face_detector.detect(frame)
+                        if self._inference_lock is not None:
+                            async with self._inference_lock:
+                                detected_faces = await asyncio.to_thread(self._face_detector.detect, frame)
+                        else:
+                            detected_faces = await asyncio.to_thread(self._face_detector.detect, frame)
                         self.latest_face_detections = detected_faces
 
                         for face in detected_faces:
@@ -604,85 +765,15 @@ class CameraWorker:
                 self.latest_face_detections = []
 
             # ── 8. Render Zone Polygons & Detections on Annotated Frame ───────
-            h, w = frame.shape[:2]
-            overlay = annotated.copy()
-            has_zones = False
-
-            for z in self._zones:
-                coords = z.get("polygon_coords", [])
-                if not coords or len(coords) < 3:
-                    continue
-
-                has_zones = True
-                pts = (np.array(coords, dtype=np.float32) * np.array([w, h])).astype(np.int32)
-                pts = pts.reshape((-1, 1, 2))
-
-                is_restricted = (z.get("restriction_level", "RESTRICTED").upper() == "RESTRICTED")
-                poly_color = (0, 0, 220) if is_restricted else (220, 200, 0)
-
-                cv2.fillPoly(overlay, [pts], poly_color)
-                cv2.polylines(annotated, [pts], isClosed=True, color=poly_color, thickness=1)
-
-                lbl_x = int(pts[0][0][0])
-                lbl_y = int(pts[0][0][1])
-                zone_label = f"[{z.get('restriction_level', 'RESTRICTED')}] {z.get('id', '')}: {z.get('name', '')}"
-                _draw_pill_badge(annotated, zone_label, lbl_x, lbl_y, poly_color, font_scale=0.38)
-
-            if has_zones:
-                cv2.addWeighted(overlay, 0.25, annotated, 0.75, 0, annotated)
-
-            # Draw bounding boxes, track labels, and ANPR plate overlays
-            for t in detections:
-                tid = t["track_id"]
-                x1, y1, x2, y2 = int(t["bbox"][0]), int(t["bbox"][1]), int(t["bbox"][2]), int(t["bbox"][3])
-                obj_class = t["object_class"]
-                conf = t["confidence"]
-
-                zones_inside = active_zone_map.get(tid, [])
-                is_in_restricted = any(z.get("restriction_level", "RESTRICTED").upper() == "RESTRICTED" for z in zones_inside)
-                is_in_monitored = any(z.get("restriction_level", "RESTRICTED").upper() == "MONITORED" for z in zones_inside)
-
-                # ANPR read state
-                anpr_info = self._anpr_state.get(tid, {})
-                plate_text = anpr_info.get("plate")
-                is_plate_match = anpr_info.get("is_match", False)
-                plate_list_type = anpr_info.get("list_type")
-
-                if is_in_restricted or (is_plate_match and plate_list_type == "BLACKLIST"):
-                    box_color = (0, 0, 255)  # Bright RED for restricted intrusion or blacklist match
-                    status_tag = " [INTRUSION]" if is_in_restricted else " [BLACKLIST]"
-                elif is_in_monitored:
-                    box_color = (0, 255, 255)  # Yellow for monitored zone
-                    status_tag = " [MONITORED]"
-                elif is_plate_match and plate_list_type == "WHITELIST":
-                    box_color = (0, 200, 0)
-                    status_tag = " [WHITELIST]"
-                else:
-                    box_color = (0, 255, 0) if obj_class == "person" else (255, 128, 0)
-                    status_tag = ""
-
-                plate_tag = f" · {plate_text}" if plate_text else ""
-                label = f"#{tid} {obj_class} {int(conf * 100)}%{status_tag}{plate_tag}"
-
-                # 1.5px / 1px crisp bounding box
-                cv2.rectangle(annotated, (x1, y1), (x2, y2), box_color, 1)
-                # Floating pill badge with Slate-900 backdrop and accent dot
-                _draw_pill_badge(annotated, label, x1, y1, box_color, font_scale=0.38)
-
-            # Draw face detection bounding boxes (1px stroke + non-overlapping pill badge below)
-            for f in self.latest_face_detections:
-                fx1, fy1, fx2, fy2 = int(f["bbox"][0]), int(f["bbox"][1]), int(f["bbox"][2]), int(f["bbox"][3])
-                fconf = f["confidence"]
-                face_color = (255, 180, 0)  # Defense cyan/blue in BGR
-                cv2.rectangle(annotated, (fx1, fy1), (fx2, fy2), face_color, 1)
-                _draw_pill_badge(
-                    annotated,
-                    f"FACE {int(fconf * 100)}%",
-                    fx1,
-                    fy2 + 16,
-                    face_color,
-                    font_scale=0.34,
-                )
+            annotated = await asyncio.to_thread(
+                _render_annotations,
+                frame,
+                self._zones,
+                detections,
+                active_zone_map,
+                self._anpr_state,
+                self.latest_face_detections,
+            )
 
             self.latest_detections = detections
             self.latest_frame_annotated = annotated
@@ -691,7 +782,17 @@ class CameraWorker:
 
         if cap:
             cap.release()
+        if self._http_client is not None and not self._http_client.is_closed:
+            await self._http_client.aclose()
         logger.info(f"[{self.camera_id}] Stopped CameraWorker")
 
     def stop(self):
         self.is_running = False
+        self.is_connected = False
+        self.connection_state = "OFFLINE"
+        if self._http_client is not None and not self._http_client.is_closed:
+            try:
+                loop = asyncio.get_running_loop()
+                loop.create_task(self._http_client.aclose())
+            except RuntimeError:
+                pass

@@ -85,56 +85,71 @@ def normalize_and_validate_plate(candidate: str) -> Optional[str]:
     return None
 
 
+from concurrent.futures import ProcessPoolExecutor
+
+_ocr_worker_instance = None
+
+
+def _process_crop_in_worker(vehicle_crop: np.ndarray) -> List[Tuple[str, float, Any]]:
+    global _ocr_worker_instance
+    if _ocr_worker_instance is None:
+        import os
+        os.environ["FLAGS_use_mkldnn"] = "0"
+        os.environ["PADDLE_DISABLE_MKLDNN"] = "1"
+        os.environ["OMP_NUM_THREADS"] = "1"
+        os.environ["PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK"] = "True"
+        from paddleocr import PaddleOCR
+        _ocr_worker_instance = PaddleOCR(
+            use_doc_orientation_classify=False,
+            use_doc_unwarping=False,
+            use_textline_orientation=False,
+            lang="en",
+        )
+
+    try:
+        results = _ocr_worker_instance.ocr(vehicle_crop)
+    except Exception:
+        return []
+
+    candidates = []
+    if not results:
+        return candidates
+
+    first_elem = results[0]
+    if isinstance(first_elem, dict) and "rec_texts" in first_elem:
+        rec_texts = first_elem.get("rec_texts", [])
+        rec_scores = first_elem.get("rec_scores", [])
+        rec_polys = first_elem.get("rec_polys", [None] * len(rec_texts))
+        for text, score, poly in zip(rec_texts, rec_scores, rec_polys):
+            poly_list = poly.tolist() if hasattr(poly, "tolist") else poly
+            candidates.append((str(text), float(score), poly_list))
+    elif isinstance(first_elem, (list, tuple)):
+        for line in first_elem:
+            if not line or len(line) < 2:
+                continue
+            box = line[0]
+            text_conf = line[1]
+            if not text_conf or len(text_conf) < 2:
+                continue
+            box_list = box.tolist() if hasattr(box, "tolist") else box
+            candidates.append((str(text_conf[0]), float(text_conf[1]), box_list))
+
+    return candidates
+
+
 class ANPRProcessor:
     def __init__(self, confidence_threshold: float = 0.50):
         self.confidence_threshold = confidence_threshold
-        self._ocr = None
-        self._init_error = None
+        self._executor: Optional[ProcessPoolExecutor] = None
 
-    @staticmethod
-    def _apply_cpu_compatibility():
-        """Ensure Paddle CPU predictor does not crash on Windows due to oneDNN/PIR instruction mismatches."""
-        try:
-            import paddle.inference as p_inf
-            if not getattr(p_inf, "_ibvap_cpu_patched", False):
-                orig_create_pred = p_inf.create_predictor
-
-                def patched_create_pred(config):
-                    if hasattr(config, "disable_onednn"):
-                        config.disable_onednn()
-                    if hasattr(config, "disable_mkldnn"):
-                        config.disable_mkldnn()
-                    if hasattr(config, "enable_new_ir"):
-                        config.enable_new_ir(False)
-                    return orig_create_pred(config)
-
-                p_inf.create_predictor = patched_create_pred
-                p_inf._ibvap_cpu_patched = True
-        except Exception as e:
-            logger.debug(f"[ANPRProcessor] CPU compatibility hook: {e}")
-
-    def _get_ocr(self):
-        """Lazy-load PaddleOCR in CPU mode."""
-        if self._ocr is not None:
-            return self._ocr
-        if self._init_error is not None:
-            return None
-
-        try:
-            self._apply_cpu_compatibility()
-            from paddleocr import PaddleOCR
-            # Initialize in CPU mode without angle classifier to keep inference fast
-            self._ocr = PaddleOCR(use_angle_cls=False, lang="en")
-            logger.info("[ANPRProcessor] PaddleOCR loaded successfully in CPU mode.")
-            return self._ocr
-        except Exception as e:
-            self._init_error = str(e)
-            logger.warning(f"[ANPRProcessor] PaddleOCR failed to initialize: {e}")
-            return None
+    def _get_executor(self) -> ProcessPoolExecutor:
+        if self._executor is None:
+            self._executor = ProcessPoolExecutor(max_workers=1)
+        return self._executor
 
     def process(self, vehicle_crop: np.ndarray) -> Optional[Dict[str, Any]]:
         """
-        Runs text detection and recognition on cropped vehicle region.
+        Runs text detection and recognition on cropped vehicle region in a separate process.
 
         Args:
             vehicle_crop: BGR image crop of detected vehicle.
@@ -149,50 +164,22 @@ class ANPRProcessor:
         if h < 20 or w < 30:
             return None
 
-        ocr = self._get_ocr()
-        if ocr is None:
-            return None
-
         t0 = time.perf_counter()
         try:
-            # Run OCR on crop (PaddleOCR 3.x uses ocr(crop), older versions accepted cls=False)
-            try:
-                results = ocr.ocr(vehicle_crop)
-            except TypeError:
-                results = ocr.ocr(vehicle_crop, cls=False)
+            ex = self._get_executor()
+            future = ex.submit(_process_crop_in_worker, vehicle_crop)
+            candidates = future.result(timeout=2.0)
         except Exception as e:
             logger.debug(f"[ANPRProcessor] OCR inference error: {e}")
             return None
 
         latency_ms = (time.perf_counter() - t0) * 1000
 
-        if not results:
+        if not candidates:
             return None
 
         best_match = None
         highest_conf = 0.0
-
-        # Extract text entries across PaddleOCR versions
-        candidates: List[Tuple[str, float, Any]] = []
-
-        first_elem = results[0]
-        # PaddleOCR 3.x / paddlex dict result format: [{'rec_texts': [...], 'rec_scores': [...], 'rec_boxes': [...]}]
-        if isinstance(first_elem, dict) and "rec_texts" in first_elem:
-            rec_texts = first_elem.get("rec_texts", [])
-            rec_scores = first_elem.get("rec_scores", [])
-            rec_polys = first_elem.get("rec_polys", [None] * len(rec_texts))
-            for text, score, poly in zip(rec_texts, rec_scores, rec_polys):
-                candidates.append((str(text), float(score), poly))
-        # PaddleOCR 2.x list result format: [[[box, (text, score)], ...]]
-        elif isinstance(first_elem, (list, tuple)):
-            for line in first_elem:
-                if not line or len(line) < 2:
-                    continue
-                box = line[0]
-                text_conf = line[1]
-                if not text_conf or len(text_conf) < 2:
-                    continue
-                candidates.append((str(text_conf[0]), float(text_conf[1]), box))
 
         for raw_text, conf, box in candidates:
             validated_plate = normalize_and_validate_plate(raw_text)
@@ -204,7 +191,7 @@ class ANPRProcessor:
                         "plate_text": validated_plate,
                         "confidence": round(conf, 3),
                         "raw_text": raw_text,
-                        "crop_bbox": box.tolist() if hasattr(box, "tolist") else box,
+                        "crop_bbox": box,
                         "latency_ms": round(latency_ms, 1),
                     }
 
@@ -215,3 +202,4 @@ class ANPRProcessor:
             )
 
         return best_match
+

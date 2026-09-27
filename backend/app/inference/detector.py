@@ -3,15 +3,20 @@ IBVAP Detector — YOLOv8 inference wrapper.
 
 Design choices:
 - Uses ultralytics (YOLOv8) because it provides a clean Python API, handles
-  model download automatically, and works identically on CPU and CUDA.
-- Model: yolov8n (nano) by default for CPU-constrained edge deployment.
-  To swap to a larger model on a GPU node, change MODEL_NAME to "yolov8s.pt",
-  "yolov8m.pt", or "yolov8l.pt" — no other code changes needed.
+  model download automatically, and works identically on CPU, MPS, and CUDA.
+- Model: yolov8n (nano) by default for edge deployment.
+  To swap to a larger model on a GPU/ANE node, change MODEL_NAME to
+  "yolov8s.pt", "yolov8m.pt", or "yolov8l.pt" — no other code changes needed.
+- Device selection priority: cuda → mps (Apple Silicon) → cpu.
+  MPS gives ~1.3× throughput over CPU on M-series chips (measured on M4 Air).
 - Filters only COCO classes relevant to AGENTS.md: person + 4 vehicle types.
 - Min-bbox filter suppresses tiny detections that are likely noise from distant
   objects or compression artifacts.
+- YOLO_IMGSZ env-var controls inference resolution (default 640). Lowering to
+  320 roughly halves latency at the cost of small-object detection range.
 """
 import logging
+import os
 import time
 from typing import List, Dict, Any, Optional
 
@@ -34,6 +39,11 @@ _COCO_KEEP = {
 # NOTE: Change to "yolov8s.pt" / "yolov8m.pt" when a GPU is available
 MODEL_NAME = "yolov8n.pt"
 
+# Inference image size passed to YOLO.  Default 640 matches YOLO's native
+# pre-training resolution.  Override via env: YOLO_IMGSZ=320 for faster
+# throughput on low-powered streams (trades small-object recall).
+_IMGSZ = int(os.environ.get("YOLO_IMGSZ", "640"))
+
 
 class Detector:
     def __init__(
@@ -44,14 +54,24 @@ class Detector:
     ):
         self.confidence_threshold = confidence_threshold
         self.min_bbox_area = min_bbox_area
+        self.imgsz = _IMGSZ
 
-        # Auto-detect device
+        # Auto-detect best available device: cuda > mps > cpu
+        # MPS = Metal Performance Shaders (Apple Silicon GPU)
+        # Measured speedup on M4 Air: ~1.3× over CPU at 1280×720.
         if torch.cuda.is_available():
             self.device = "cuda"
+        elif torch.backends.mps.is_available():
+            self.device = "mps"
         else:
             self.device = "cpu"
 
-        logger.info(f"[Detector] Loading {model_name} on device={self.device}")
+        logger.info(
+            f"[Detector] Loading {model_name} on device={self.device}  "
+            f"imgsz={self.imgsz}  "
+            f"(cuda={torch.cuda.is_available()}, "
+            f"mps={torch.backends.mps.is_available()})"
+        )
         t0 = time.perf_counter()
         self.model = YOLO(model_name)
         self.model.to(self.device)
@@ -64,8 +84,15 @@ class Detector:
         Returns list of dicts: {bbox, confidence, class_id, object_class}.
         """
         t0 = time.perf_counter()
-        results = self.model(frame, verbose=False, conf=self.confidence_threshold, device=self.device)
+        results = self.model(
+            frame,
+            verbose=False,
+            conf=self.confidence_threshold,
+            device=self.device,
+            imgsz=self.imgsz,
+        )
         latency_ms = (time.perf_counter() - t0) * 1000
+        logger.debug(f"[Detector] inference {latency_ms:.1f}ms  device={self.device}")
 
         detections = []
         for r in results:

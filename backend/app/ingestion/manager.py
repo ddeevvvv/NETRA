@@ -16,7 +16,18 @@ class IngestionManager:
         self.tasks: Dict[str, asyncio.Task] = {}
         self._detector = None  # shared singleton across all workers
         self._face_detector = None  # shared face detector singleton
+        self._anpr = None  # shared ANPR singleton across all workers
         self._tracker_cls = None  # each camera gets its own Tracker instance
+        self._inference_lock: Optional[asyncio.Lock] = None
+
+    def get_inference_lock(self) -> asyncio.Lock:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        if self._inference_lock is None or (loop and getattr(self._inference_lock, "_loop", None) not in (None, loop)):
+            self._inference_lock = asyncio.Lock()
+        return self._inference_lock
 
     def _init_inference(self):
         """Lazy-initialise Detector & FaceDetector once (model load is slow — do it on first need)."""
@@ -26,14 +37,17 @@ class IngestionManager:
             from app.inference.detector import Detector
             from app.inference.tracker import Tracker
             from app.inference.face_detector import FaceDetector
+            from app.inference.anpr import ANPRProcessor
             self._detector = Detector()
             self._face_detector = FaceDetector()
+            self._anpr = ANPRProcessor()
             self._tracker_cls = Tracker
             logger.info("[IngestionManager] Inference components ready.")
         except Exception as e:
             logger.warning(f"[IngestionManager] Inference unavailable (run without GPU?): {e}")
             self._detector = None
             self._face_detector = None
+            self._anpr = None
             self._tracker_cls = None
 
     def get_worker(self, camera_id: str) -> Optional[CameraWorker]:
@@ -92,7 +106,13 @@ class IngestionManager:
             self._init_inference()
             if self._detector and self._tracker_cls:
                 tracker = self._tracker_cls(frame_rate=int(target_fps))
-                worker.set_inference(self._detector, tracker, face_detector=self._face_detector)
+                worker.set_inference(
+                    self._detector,
+                    tracker,
+                    anpr=self._anpr,
+                    face_detector=self._face_detector,
+                    inference_lock=self.get_inference_lock(),
+                )
             else:
                 logger.warning(f"[{camera_id}] Inference requested but unavailable — running detection-free.")
 
