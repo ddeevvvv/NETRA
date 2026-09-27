@@ -7,14 +7,16 @@ import ANPRPanel from './components/ANPRPanel'
 import ZonesList from './components/ZonesList'
 import StatsStrip from './components/StatsStrip'
 import MapView from './components/MapView'
+import FacesView from './components/FacesView'
 import { getCameras, getCameraHealth, getSitesStatus } from './api'
-import { ShieldCheck, LayoutDashboard, MapPin, Search } from 'lucide-react'
+import { ShieldCheck, LayoutDashboard, MapPin, Search, User } from 'lucide-react'
 import './index.css'
 
 const VIEWS = {
   dashboard: { label: 'Dashboard', icon: LayoutDashboard },
   map: { label: 'Site Map', icon: MapPin },
   investigate: { label: 'Investigate', icon: Search },
+  faces: { label: 'Faces', icon: User },
 }
 
 export default function App() {
@@ -241,6 +243,10 @@ export default function App() {
 
         {view === 'investigate' && (
           <InvestigateView cameras={cameras} initialPlate={trackPlateTarget} />
+        )}
+
+        {view === 'faces' && (
+          <FacesView />
         )}
       </div>
     </div>
