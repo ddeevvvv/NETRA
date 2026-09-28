@@ -53,16 +53,16 @@ class FaceDetector:
             except Exception as e:
                 logger.warning(f"[FaceDetector] Failed to load Caffe DNN model: {e}")
 
-        # 2. Fallback to OpenCV Haar Cascade (ships natively with opencv-python)
-        if self.net is None:
-            cascade_dir = getattr(cv2.data, "haarcascades", "")
-            cascade_file = os.path.join(cascade_dir, "haarcascade_frontalface_default.xml")
-            if os.path.isfile(cascade_file):
-                self.cascade = cv2.CascadeClassifier(cascade_file)
+        # 2. Always load OpenCV Haar Cascade as secondary fallback
+        cascade_dir = getattr(cv2.data, "haarcascades", "")
+        cascade_file = os.path.join(cascade_dir, "haarcascade_frontalface_default.xml")
+        if os.path.isfile(cascade_file):
+            self.cascade = cv2.CascadeClassifier(cascade_file)
+            if self.net is None:
                 self.backend = "haar"
                 logger.info(f"[FaceDetector] Using built-in Haar Cascade from {cascade_file}")
-            else:
-                logger.warning(f"[FaceDetector] Haar cascade not found at {cascade_file}")
+        else:
+            logger.warning(f"[FaceDetector] Haar cascade not found at {cascade_file}")
 
     def detect(self, frame: np.ndarray) -> List[Dict[str, Any]]:
         """
@@ -110,24 +110,25 @@ class FaceDetector:
                     "object_class": "face",
                 })
 
-        elif self.cascade is not None:
+        # Fallback to Haar Cascade if DNN produced no detections or if Haar is primary backend
+        if len(detections) == 0 and self.cascade is not None:
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             try:
                 rects, _, weights = self.cascade.detectMultiScale3(
                     gray,
                     scaleFactor=1.1,
-                    minNeighbors=7,
-                    minSize=(48, 48),
+                    minNeighbors=5,
+                    minSize=(36, 36),
                     outputRejectLevels=True
                 )
             except Exception:
                 rects = self.cascade.detectMultiScale(
                     gray,
                     scaleFactor=1.1,
-                    minNeighbors=7,
-                    minSize=(48, 48)
+                    minNeighbors=5,
+                    minSize=(36, 36)
                 )
-                weights = [10.0] * len(rects)
+                weights = [6.0] * len(rects)
 
             for idx, (x, y, bw, bh) in enumerate(rects):
                 x1, y1 = float(x), float(y)
@@ -136,11 +137,11 @@ class FaceDetector:
                 if area < self.min_bbox_area:
                     continue
 
-                raw_w = float(weights[idx]) if idx < len(weights) else 10.0
-                if raw_w < 6.0:  # Suppress low-stage / weakly supported candidate windows
+                raw_w = float(weights[idx]) if idx < len(weights) else 6.0
+                if raw_w < 3.5:  # Suppress single-candidate low-weight texture noise
                     continue
                 # Map classifier weight to confidence in [0.5, 0.98]
-                conf = min(0.98, max(0.5, float(1.0 / (1.0 + np.exp(-raw_w / 4.0)))))
+                conf = min(0.98, max(0.5, float(1.0 / (1.0 + np.exp(-raw_w / 3.0)))))
                 if conf < self.confidence_threshold:
                     continue
 
