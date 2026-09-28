@@ -116,18 +116,18 @@ class FaceDetector:
                 rects, _, weights = self.cascade.detectMultiScale3(
                     gray,
                     scaleFactor=1.1,
-                    minNeighbors=4,
-                    minSize=(30, 30),
+                    minNeighbors=7,
+                    minSize=(48, 48),
                     outputRejectLevels=True
                 )
             except Exception:
                 rects = self.cascade.detectMultiScale(
                     gray,
                     scaleFactor=1.1,
-                    minNeighbors=4,
-                    minSize=(30, 30)
+                    minNeighbors=7,
+                    minSize=(48, 48)
                 )
-                weights = [5.0] * len(rects)
+                weights = [10.0] * len(rects)
 
             for idx, (x, y, bw, bh) in enumerate(rects):
                 x1, y1 = float(x), float(y)
@@ -136,9 +136,11 @@ class FaceDetector:
                 if area < self.min_bbox_area:
                     continue
 
-                raw_w = float(weights[idx]) if idx < len(weights) else 5.0
+                raw_w = float(weights[idx]) if idx < len(weights) else 10.0
+                if raw_w < 6.0:  # Suppress low-stage / weakly supported candidate windows
+                    continue
                 # Map classifier weight to confidence in [0.5, 0.98]
-                conf = min(0.98, max(0.5, float(1.0 / (1.0 + np.exp(-raw_w / 3.0)))))
+                conf = min(0.98, max(0.5, float(1.0 / (1.0 + np.exp(-raw_w / 4.0)))))
                 if conf < self.confidence_threshold:
                     continue
 
