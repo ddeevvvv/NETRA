@@ -3,8 +3,6 @@ import CameraGrid from './components/CameraGrid'
 import AlertPanel from './components/AlertPanel'
 import HealthStrip from './components/HealthStrip'
 import InvestigateView from './components/InvestigateView'
-import ANPRPanel from './components/ANPRPanel'
-import ZonesList from './components/ZonesList'
 import StatsStrip from './components/StatsStrip'
 import MapView from './components/MapView'
 import FacesView from './components/FacesView'
@@ -30,15 +28,12 @@ export default function App() {
   // alerts list comes from AlertPanel (WS stream), unackedCount from DB-authoritative sites/status
   const [alertList, setAlertList] = useState([])
   const [unackedCount, setUnackedCount] = useState(0)
-  const [zoneCount, setZoneCount] = useState(0)
-  const [zoneVersion, setZoneVersion] = useState(0)
   const [trackPlateTarget, setTrackPlateTarget] = useState(() => {
     return typeof window !== 'undefined' ? (new URLSearchParams(window.location.search).get('plate') || '') : ''
   })
 
   const highlightTimersRef = useRef({})
   const [alertHighlightMap, setAlertHighlightMap] = useState({})
-  const [drawTarget, setDrawTarget] = useState(null)
 
   const handleTrackPlate = useCallback((plate) => {
     setTrackPlateTarget(plate)
@@ -85,13 +80,7 @@ export default function App() {
     }, 5000)
   }, [])
 
-  const handleZoneCount = useCallback((count) => {
-    setZoneCount(count)
-  }, [])
 
-  const handleZoneChange = useCallback(() => {
-    setZoneVersion((v) => v + 1)
-  }, [])
 
   // Load camera list on startup
   useEffect(() => {
@@ -181,7 +170,6 @@ export default function App() {
           healthMap={healthMap}
           alerts={alertList}
           unackedCount={unackedCount}
-          zoneCount={zoneCount}
         />
       )}
 
@@ -202,23 +190,7 @@ export default function App() {
                   cameras={cameras}
                   healthMap={healthMap}
                   alertHighlightMap={alertHighlightMap}
-                  drawTarget={drawTarget}
-                  onClearDrawTarget={() => setDrawTarget(null)}
-                  onZoneChange={handleZoneChange}
                 />
-
-                {/* Sub-panels for Active Zones & ANPR Activity */}
-                <div className="dashboard-analytics-row">
-                  <ZonesList
-                    cameras={cameras}
-                    zoneVersion={zoneVersion}
-                    onZoneCount={handleZoneCount}
-                    onZoneChange={handleZoneChange}
-                    onStartRedraw={(target) => setDrawTarget(target)}
-                  />
-
-                  <ANPRPanel cameras={cameras} />
-                </div>
               </div>
 
               {/* Consolidated Health Strip pinned at bottom */}

@@ -9,7 +9,6 @@ import {
   Radio,
   PauseCircle,
   RefreshCw,
-  PenTool,
   Undo2,
   Check,
   X,
@@ -105,7 +104,12 @@ export default function CameraGrid({
   }
 
   const selectedCam = cameras.find((c) => c.id === selectedCamId) || null
-  const gridClass = cameras.length >= 9 ? 'camera-grid camera-grid-9' : 'camera-grid'
+  const gridClass =
+    cameras.length >= 9
+      ? 'camera-grid camera-grid-9'
+      : cameras.length >= 6
+        ? 'camera-grid camera-grid-6'
+        : 'camera-grid'
 
   return (
     <>
@@ -320,15 +324,6 @@ function CameraCard({
             aria-label={isSelected ? 'Close preview' : 'Open full preview'}
           >
             {isSelected ? <X size={11} /> : <RotateCcw size={11} style={{ transform: 'rotate(45deg)' }} />}
-          </button>
-          <button
-            type="button"
-            className={`btn-add-zone ${isDrawing ? 'btn-drawing-active' : ''}`}
-            onClick={() => (isDrawing ? onCancelDraw() : onStartDraw())}
-            title={isDrawing ? 'Cancel drawing' : 'Draw a new virtual fence zone on this camera feed'}
-          >
-            <PenTool size={11} />
-            <span>{isDrawing ? 'Cancel Draw' : 'Add Zone'}</span>
           </button>
           <StatusBadge status={status} fps={health?.measured_fps} />
         </div>
