@@ -100,6 +100,7 @@ def get_sites_status(db: Session = Depends(get_db)):
             site_cameras_map["BOP-01"].append(cam)
 
     # Fetch all actionable unacknowledged incident events for alert severity calculation
+    # Only count events that require acknowledgment (exclude CAMERA_HEALTH and similar informational events)
     unacked_events = (
         db.query(Event)
         .filter(

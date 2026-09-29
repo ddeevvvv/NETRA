@@ -3771,7 +3771,8 @@ select:focus, input:focus {
    9-CAMERA 3x3 GRID + PREVIEW PANEL
    ======================================================= */
 
-.camera-grid-9 {
+.camera-grid-9,
+.camera-grid-6 {
   display: grid;
   grid-template-columns: repeat(3, 1fr);
   gap: var(--sp-2);
