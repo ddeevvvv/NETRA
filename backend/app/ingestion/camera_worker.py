@@ -258,6 +258,9 @@ class CameraWorker:
         self.recent_anpr_crops: List[Dict[str, Any]] = []
         self._last_watchlist_sync_time = 0.0
 
+        # VEHICLE_DETECTED debounce — track_ids that already fired this ingestion session
+        self._vehicle_alerted_tracks: set = set()
+
         # Night-mode / NIGHT_MOVEMENT detection state
         self._night_mode_active: bool = False
         self._last_night_event_time: float = 0.0
@@ -754,6 +757,40 @@ class CameraWorker:
                                     self.recent_anpr_crops.pop(0)
 
                 detections = tracks
+
+                # 7b-extra. VEHICLE_DETECTED — fire once per new vehicle track_id
+                LARGE_VEHICLES = {"truck", "bus"}
+                for t in tracks:
+                    tid = t["track_id"]
+                    obj_class = t["object_class"]
+                    if obj_class in VEHICLE_CLASSES and tid not in self._vehicle_alerted_tracks:
+                        self._vehicle_alerted_tracks.add(tid)
+                        severity = "HIGH" if obj_class in LARGE_VEHICLES else "WARNING"
+                        asyncio.create_task(self._post_event({
+                            "camera_id": self.camera_id,
+                            "type": "VEHICLE_DETECTED",
+                            "severity": severity,
+                            "timestamp": datetime.now(timezone.utc).isoformat(),
+                            "object_type": obj_class,
+                            "track_id": tid,
+                            "confidence": round(t.get("confidence", 0.0), 3),
+                            "zone_id": None,
+                            "evidence": {},
+                            "metadata": {
+                                "rule_name": "Vehicle Detected",
+                                "vehicle_class": obj_class,
+                                "bbox": [round(c, 1) for c in t.get("bbox", [])],
+                            },
+                        }))
+                        logger.info(
+                            f"[{self.camera_id}] EMIT VEHICLE_DETECTED ({severity}) — "
+                            f"class={obj_class} track_id={tid} conf={t.get('confidence', 0):.2f}"
+                        )
+                    # Prune stale track IDs to avoid unbounded growth (keep last 500)
+                    if len(self._vehicle_alerted_tracks) > 500:
+                        self._vehicle_alerted_tracks = set(
+                            list(self._vehicle_alerted_tracks)[-500:]
+                        )
 
                 # 7c. Face Detection & Restricted Zone Alerting
                 if self._face_detector is not None:
