@@ -60,13 +60,6 @@ CAMERAS = [
         "location": "West Perimeter",
         "status": "active",
     },
-    {
-        "id": "CAM-09",
-        "name": "Aerial Observation (4K)",
-        "rtsp_url": "/feeds/cam9.mp4",
-        "location": "Aerial OP",
-        "status": "active",
-    },
 ]
 
 
