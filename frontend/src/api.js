@@ -294,3 +294,42 @@ export async function downloadVehicleEvidencePackage(plate, format = 'pdf') {
   const res = await fetch(`${BASE}/vehicles/${encodeURIComponent(plate.trim())}/evidence-package?format=${format}`)
   await triggerFileDownload(res, `IBVAP_Vehicle_${plate.trim()}.${format}`)
 }
+
+/**
+ * Fetch all site restriction zones.
+ * @param {string} [siteId] Optional site filter
+ */
+export async function getSiteRestrictions(siteId) {
+  const params = new URLSearchParams()
+  if (siteId) params.set('site_id', siteId)
+  const res = await fetch(`${BASE}/sites/restrictions?${params}`)
+  if (!res.ok) throw new Error(`GET /sites/restrictions failed: ${res.status}`)
+  return res.json()
+}
+
+/**
+ * Create a new site-level restriction zone.
+ * @param {{ site_id: string, name?: string, restriction_level?: string, polygon_geojson: any, is_active?: boolean }} data
+ */
+export async function createSiteRestriction(data) {
+  const res = await fetch(`${BASE}/sites/restrictions`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(data),
+  })
+  if (!res.ok) throw new Error(`POST /sites/restrictions failed: ${res.status}`)
+  return res.json()
+}
+
+/**
+ * Delete a site restriction zone.
+ * @param {string} restrictionId
+ */
+export async function deleteSiteRestriction(restrictionId) {
+  const res = await fetch(`${BASE}/sites/restrictions/${encodeURIComponent(restrictionId)}`, {
+    method: 'DELETE',
+  })
+  if (!res.ok) throw new Error(`DELETE /sites/restrictions failed: ${res.status}`)
+  return res.json()
+}
+

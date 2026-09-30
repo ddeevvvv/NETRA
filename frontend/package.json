@@ -11,9 +11,12 @@
   },
   "dependencies": {
     "framer-motion": "^12.43.0",
+    "leaflet": "^1.9.4",
+    "leaflet-draw": "^1.0.4",
     "lucide-react": "^1.46.0",
     "react": "^19.2.8",
-    "react-dom": "^19.2.8"
+    "react-dom": "^19.2.8",
+    "react-leaflet": "^5.0.0"
   },
   "devDependencies": {
     "@types/react": "^19.2.18",

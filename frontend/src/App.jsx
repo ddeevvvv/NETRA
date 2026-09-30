@@ -35,10 +35,23 @@ export default function App() {
   const highlightTimersRef = useRef({})
   const [alertHighlightMap, setAlertHighlightMap] = useState({})
 
+  const handleViewChange = useCallback((newView) => {
+    setView(newView)
+    if (typeof window !== 'undefined') {
+      const url = new URL(window.location.href)
+      if (newView === 'dashboard') {
+        url.searchParams.delete('view')
+      } else {
+        url.searchParams.set('view', newView)
+      }
+      window.history.replaceState({}, '', url.toString())
+    }
+  }, [])
+
   const handleTrackPlate = useCallback((plate) => {
     setTrackPlateTarget(plate)
-    setView('investigate')
-  }, [])
+    handleViewChange('investigate')
+  }, [handleViewChange])
 
   // AlertPanel callback — only use the alerts list for today-count display.
   // unackedCount is managed separately via sites/status so it matches the Map.
@@ -205,7 +218,7 @@ export default function App() {
                 key={key}
                 id={`nav-${key}`}
                 className={`nav-btn ${view === key ? 'active' : ''}`}
-                onClick={() => setView(key)}
+                onClick={() => handleViewChange(key)}
               >
                 <Icon size={14} />
                 <span>{config.label}</span>
@@ -262,7 +275,7 @@ export default function App() {
         )}
 
         {view === 'map' && (
-          <MapView onNavigateToDashboard={() => setView('dashboard')} />
+          <MapView onNavigateToDashboard={() => handleViewChange('dashboard')} />
         )}
 
         {view === 'investigate' && (

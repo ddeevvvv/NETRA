@@ -207,17 +207,27 @@ function AlertItem({ alert, acking, onAck, onTrackPlate }) {
   if (alert.confidence != null) metaParts.push(`conf: ${(alert.confidence * 100).toFixed(0)}%`)
   if (meta.condition) metaParts.push(meta.condition)
 
+  const isRestrictedZone = Boolean(meta.restricted_zone_active)
+
   return (
     <div
       className={`alert-item sev-${alert.severity} type-${(alert.type || '').toLowerCase()} ${alert.acknowledged ? 'acked' : ''} ${
         isExpanded ? 'expanded' : ''
-      }`}
+      } ${isRestrictedZone ? 'alert-item-restricted' : ''}`}
       onClick={() => setIsExpanded(!isExpanded)}
     >
       <div className="alert-header-row">
         <div className="alert-badge-group">
           <SeverityBadge severity={alert.severity} />
           {alert.camera_id && <span className="alert-cam-tag">{alert.camera_id}</span>}
+          {isRestrictedZone && (
+            <span
+              className="alert-tag-restricted"
+              title={`Site Restriction Active: ${meta.restriction_site_id || ''} (${meta.restriction_level || 'HIGH'})`}
+            >
+              🛡️ RESTRICTED
+            </span>
+          )}
           {alert.type === 'NIGHT_MOVEMENT'
             ? <span className="event-type-night-movement">🌙 {alert.type}</span>
             : <span className="alert-type">{alert.type}</span>
