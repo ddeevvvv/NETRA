@@ -216,6 +216,9 @@ class CameraWorker:
         self.is_connected = False
         self.is_frozen = False
         self.is_low_fps = False
+        # LOW_FPS hysteresis timers (seconds-based monotonic timestamps)
+        self._low_fps_since: float = 0.0
+        self._fps_recovered_since: float = 0.0
 
         self.connection_state: str = "OFFLINE"  # ONLINE, DEGRADED, RECONNECTING, OFFLINE
         self.reconnect_attempt_count: int = 0
@@ -260,11 +263,13 @@ class CameraWorker:
 
         # VEHICLE_DETECTED debounce — track_ids that already fired this ingestion session
         self._vehicle_alerted_tracks: set = set()
+        # Per-camera, per-object-class 30s cooldown for VEHICLE_DETECTED (dict of last-fired times)
+        self._vehicle_event_cooldown: Dict[str, float] = {}
 
         # Night-mode / NIGHT_MOVEMENT detection state
         self._night_mode_active: bool = False
-        self._last_night_event_time: float = 0.0
-        self._night_event_debounce: float = float(os.environ.get("NIGHT_MOVEMENT_DEBOUNCE", 10.0))
+        self._night_event_cooldown: Dict[str, float] = {}
+        self._night_event_debounce: float = float(os.environ.get("NIGHT_MOVEMENT_DEBOUNCE", 30.0))
         self._night_brightness_threshold: float = float(os.environ.get("NIGHT_BRIGHTNESS_THRESHOLD", 60.0))
         self._night_movement_enabled: bool = os.environ.get("NIGHT_MOVEMENT_ENABLED", "true").lower() == "true"
         self._night_motion_threshold: float = 3.0  # mean abs-diff to count as motion in dark scene
@@ -519,24 +524,46 @@ class CameraWorker:
                 self._sampled_count = 0
                 self._fps_window_start = now
 
-                if self.measured_fps < (self.target_fps * 0.5):
+                low_threshold = self.target_fps * 0.5
+                recovery_threshold = self.target_fps * 0.8
+
+                if self.measured_fps < low_threshold:
+                    if self._low_fps_since == 0.0:
+                        self._low_fps_since = now
                     if "LOW_FPS" not in self._active_failures:
-                        self.is_low_fps = True
-                        self._active_failures.add("LOW_FPS")
-                        await self._post_health_event(
-                            severity="WARNING",
-                            condition="LOW_FPS",
-                            metadata_extra={"threshold": self.target_fps * 0.5}
-                        )
-                else:
+                        if (now - self._low_fps_since) >= 10.0:
+                            self.is_low_fps = True
+                            self._active_failures.add("LOW_FPS")
+                            await self._post_health_event(
+                                severity="WARNING",
+                                condition="LOW_FPS",
+                                metadata_extra={
+                                    "threshold": low_threshold,
+                                    "measured_fps": round(self.measured_fps, 2),
+                                    "duration_seconds": round(now - self._low_fps_since, 1),
+                                }
+                            )
+                    self._fps_recovered_since = 0.0
+                elif self.measured_fps >= recovery_threshold:
                     if "LOW_FPS" in self._active_failures:
-                        self.is_low_fps = False
-                        self._active_failures.remove("LOW_FPS")
-                        await self._post_health_event(
-                            severity="INFO",
-                            condition="RECOVERED",
-                            metadata_extra={"restored_issue": "LOW_FPS"}
-                        )
+                        if self._fps_recovered_since == 0.0:
+                            self._fps_recovered_since = now
+                        if (now - self._fps_recovered_since) >= 30.0:
+                            self.is_low_fps = False
+                            self._active_failures.remove("LOW_FPS")
+                            await self._post_health_event(
+                                severity="INFO",
+                                condition="RECOVERED",
+                                metadata_extra={
+                                    "restored_issue": "LOW_FPS",
+                                    "measured_fps": round(self.measured_fps, 2),
+                                    "recovery_duration_seconds": round(now - self._fps_recovered_since, 1),
+                                }
+                            )
+                    self._low_fps_since = 0.0
+                else:
+                    self._low_fps_since = 0.0
+                    self._fps_recovered_since = 0.0
 
             # ── 6. Frozen Frame Detection ─────────────────────────────────────
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -580,9 +607,9 @@ class CameraWorker:
                 motion_score = float(np.mean(diff_nm))
                 if (
                     motion_score > self._night_motion_threshold
-                    and (now - self._last_night_event_time) >= self._night_event_debounce
+                    and (now - self._night_event_cooldown.get("motion", 0.0)) >= self._night_event_debounce
                 ):
-                    self._last_night_event_time = now
+                    self._night_event_cooldown["motion"] = now
                     asyncio.create_task(self._post_event({
                         "camera_id": self.camera_id,
                         "type": "NIGHT_MOVEMENT",
@@ -764,27 +791,29 @@ class CameraWorker:
                     tid = t["track_id"]
                     obj_class = t["object_class"]
                     if obj_class in VEHICLE_CLASSES and tid not in self._vehicle_alerted_tracks:
-                        self._vehicle_alerted_tracks.add(tid)
-                        severity = "HIGH" if obj_class in LARGE_VEHICLES else "WARNING"
-                        asyncio.create_task(self._post_event({
-                            "camera_id": self.camera_id,
-                            "type": "VEHICLE_DETECTED",
-                            "severity": severity,
-                            "timestamp": datetime.now(timezone.utc).isoformat(),
-                            "object_type": obj_class,
-                            "track_id": tid,
-                            "confidence": round(t.get("confidence", 0.0), 3),
-                            "zone_id": None,
-                            "evidence": {},
-                            "metadata": {
-                                "rule_name": "Vehicle Detected",
-                                "vehicle_class": obj_class,
-                                "bbox": [round(c, 1) for c in t.get("bbox", [])],
-                            },
-                        }))
-                        logger.info(
-                            f"[{self.camera_id}] EMIT VEHICLE_DETECTED ({severity}) — "
-                            f"class={obj_class} track_id={tid} conf={t.get('confidence', 0):.2f}"
+                        if (now - self._vehicle_event_cooldown.get(obj_class, 0.0)) >= 30.0:
+                            self._vehicle_event_cooldown[obj_class] = now
+                            self._vehicle_alerted_tracks.add(tid)
+                            severity = "HIGH" if obj_class in LARGE_VEHICLES else "WARNING"
+                            asyncio.create_task(self._post_event({
+                                "camera_id": self.camera_id,
+                                "type": "VEHICLE_DETECTED",
+                                "severity": severity,
+                                "timestamp": datetime.now(timezone.utc).isoformat(),
+                                "object_type": obj_class,
+                                "track_id": tid,
+                                "confidence": round(t.get("confidence", 0.0), 3),
+                                "zone_id": None,
+                                "evidence": {},
+                                "metadata": {
+                                    "rule_name": "Vehicle Detected",
+                                    "vehicle_class": obj_class,
+                                    "bbox": [round(c, 1) for c in t.get("bbox", [])],
+                                },
+                            }))
+                            logger.info(
+                                f"[{self.camera_id}] EMIT VEHICLE_DETECTED ({severity}) — "
+                                f"class={obj_class} track_id={tid} conf={t.get('confidence', 0):.2f}"
                         )
                     # Prune stale track IDs to avoid unbounded growth (keep last 500)
                     if len(self._vehicle_alerted_tracks) > 500:

@@ -44,6 +44,7 @@ class EventResponse(BaseModel):
     acknowledged: bool = False
     acknowledged_at: Optional[datetime] = None
     acknowledged_by: Optional[str] = None
+    requires_acknowledgment: bool = True
     created_at: datetime
 
     model_config = ConfigDict(from_attributes=True, populate_by_name=True)

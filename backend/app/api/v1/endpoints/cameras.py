@@ -48,6 +48,29 @@ def list_cameras(db: Session = Depends(get_db)):
     return db.query(Camera).all()
 
 
+@router.get("/health-all", response_model=Dict[str, Dict[str, Any]])
+async def get_all_camera_health(db: Session = Depends(get_db)):
+    """Returns consolidated health metrics for all registered cameras in a single payload."""
+    cameras = db.query(Camera).all()
+    result = {}
+    for cam in cameras:
+        worker = ingestion_manager.get_worker(cam.id)
+        if not worker or not worker.is_running:
+            worker = await ingestion_manager.start_camera(
+                camera_id=cam.id,
+                rtsp_url=cam.rtsp_url,
+                enable_inference=True,
+            )
+        health = worker.get_health_status()
+        if worker.last_seen_at and cam.last_seen_at != worker.last_seen_at:
+            cam.last_seen_at = worker.last_seen_at
+        elif not health.get("last_seen_at") and cam.last_seen_at:
+            health["last_seen_at"] = cam.last_seen_at.isoformat()
+        result[cam.id] = health
+    db.commit()
+    return result
+
+
 @router.get("/{camera_id}", response_model=CameraResponse)
 def get_camera(camera_id: str, db: Session = Depends(get_db)):
     camera = db.query(Camera).filter(Camera.id == camera_id).first()
