@@ -21,15 +21,49 @@ class BulkAcknowledgeRequest(BaseModel):
     event_ids: Optional[List[str]] = None
     acknowledged_by: str = "operator"
 
+from app.models.site_restriction import SiteRestriction
+from app.api.v1.endpoints.sites import get_site_for_camera_id_str
+
+SEVERITY_BUMP = {
+    "INFO": "WARNING",
+    "WARNING": "HIGH",
+    "HIGH": "CRITICAL",
+    "CRITICAL": "CRITICAL",
+    "LOW": "MEDIUM",
+    "MEDIUM": "HIGH",
+}
+
 @router.post("", response_model=EventResponse, status_code=status.HTTP_201_CREATED)
 async def create_event(
     event_in: EventCreate,
     db: Session = Depends(get_db)
 ):
     event_dict = event_in.model_dump()
-    metadata_val = event_dict.pop("metadata", {})
+    metadata_val = event_dict.pop("metadata", {}) or {}
+    if not isinstance(metadata_val, dict):
+        metadata_val = {}
+
     evt_type = (event_dict.get("type") or "").upper()
     req_ack = evt_type not in TELEMETRY_EVENT_TYPES
+
+    # Site-level restriction check:
+    # If the camera's site has an active restriction zone, tag event & elevate severity
+    cam_id = event_dict.get("camera_id")
+    site_id = get_site_for_camera_id_str(db, cam_id)
+    active_restr = (
+        db.query(SiteRestriction)
+        .filter(SiteRestriction.site_id == site_id, SiteRestriction.is_active == True)
+        .first()
+    )
+    if active_restr:
+        metadata_val["restricted_zone_active"] = True
+        metadata_val["restriction_site_id"] = site_id
+        metadata_val["restriction_level"] = active_restr.restriction_level
+        metadata_val["restriction_name"] = active_restr.name or f"{site_id} Restricted Zone"
+        
+        # Bump severity one level for alerts in restricted zones
+        cur_sev = (event_dict.get("severity") or "INFO").upper()
+        event_dict["severity"] = SEVERITY_BUMP.get(cur_sev, cur_sev)
     
     db_event = Event(
         **event_dict,
