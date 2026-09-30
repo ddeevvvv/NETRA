@@ -18,6 +18,12 @@ export async function getCameraHealth(cameraId) {
   return res.json()
 }
 
+export async function getAllCameraHealth() {
+  const res = await fetch(`${BASE}/cameras/health-all`)
+  if (!res.ok) throw new Error(`GET /cameras/health-all failed: ${res.status}`)
+  return res.json()
+}
+
 /** Returns the MJPEG stream URL to use as an <img src>. */
 export function debugStreamUrl(cameraId) {
   return `${BASE}/cameras/${cameraId}/debug/stream`

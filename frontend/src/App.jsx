@@ -6,7 +6,7 @@ import InvestigateView from './components/InvestigateView'
 import StatsStrip from './components/StatsStrip'
 import MapView from './components/MapView'
 import FacesView from './components/FacesView'
-import { getCameras, getCameraHealth, getSitesStatus } from './api'
+import { getCameras, getCameraHealth, getAllCameraHealth, getSitesStatus } from './api'
 import { ShieldCheck, LayoutDashboard, MapPin, Search, User } from 'lucide-react'
 import './index.css'
 
@@ -55,6 +55,37 @@ export default function App() {
     const camId = alert.camera_id
     if (!camId) return
 
+    // Real-time camera health synchronization from WebSocket alerts
+    if (alert.type === 'CAMERA_HEALTH') {
+      const meta = alert.metadata || alert.event_metadata || {}
+      const condition = meta.condition || ''
+      const isOffline = condition === 'OFFLINE' || condition === 'DISCONNECTED'
+      const isFrozen = condition === 'FROZEN'
+      const isLowFps = condition === 'LOW_FPS'
+      const isDegraded = isFrozen || isLowFps || condition === 'DEGRADED'
+
+      setHealthMap((prev) => {
+        const existing = prev[camId] || {
+          camera_id: camId,
+          is_connected: true,
+          connection_state: 'ONLINE',
+          measured_fps: meta.measured_fps ?? 0,
+        }
+        return {
+          ...prev,
+          [camId]: {
+            ...existing,
+            is_connected: !isOffline,
+            is_frozen: isFrozen,
+            is_low_fps: isLowFps,
+            connection_state: isOffline ? 'OFFLINE' : isDegraded ? 'DEGRADED' : 'ONLINE',
+            measured_fps: meta.measured_fps ?? existing.measured_fps,
+            last_seen_at: alert.timestamp || new Date().toISOString(),
+          },
+        }
+      })
+    }
+
     const highlight = {
       severity: alert.severity || 'HIGH',
       type: alert.type || 'ALERT',
@@ -82,10 +113,17 @@ export default function App() {
 
 
 
-  // Load camera list on startup
+  // Load camera list & initial health on startup
   useEffect(() => {
     getCameras()
-      .then(setCameras)
+      .then((cams) => {
+        setCameras(cams)
+        getAllCameraHealth()
+          .then((map) => {
+            if (map && typeof map === 'object') setHealthMap(map)
+          })
+          .catch((e) => console.error('Failed to load initial health:', e))
+      })
       .catch((e) => console.error('Failed to load cameras:', e))
   }, [])
 
@@ -117,14 +155,28 @@ export default function App() {
   // Single consolidated health polling source — runs every 10 seconds
   const refreshHealth = useCallback(async () => {
     if (!cameras.length) return
+    try {
+      const allHealth = await getAllCameraHealth()
+      if (allHealth && typeof allHealth === 'object' && Object.keys(allHealth).length > 0) {
+        setHealthMap(allHealth)
+        return
+      }
+    } catch (e) {
+      console.warn('getAllCameraHealth failed, falling back:', e)
+    }
+
     const results = await Promise.allSettled(
       cameras.map((c) => getCameraHealth(c.id).then((h) => ({ id: c.id, h })))
     )
     const map = {}
     results.forEach((r) => {
-      if (r.status === 'fulfilled') map[r.value.id] = r.value.h
+      if (r.status === 'fulfilled') {
+        map[r.value.id] = r.value.h
+      }
     })
-    setHealthMap(map)
+    if (Object.keys(map).length > 0) {
+      setHealthMap(map)
+    }
   }, [cameras])
 
   useEffect(() => {

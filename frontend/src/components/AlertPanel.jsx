@@ -73,7 +73,7 @@ export default function AlertPanel({ onStatsUpdate, onNewAlert, onTrackPlate, on
   // Notify parent of updated stats whenever alerts list changes
   useEffect(() => {
     if (!onStatsUpdate) return
-    const unacked = alerts.filter((a) => !a.acknowledged).length
+    const unacked = alerts.filter((a) => !a.acknowledged && a.requires_acknowledgment !== false).length
     onStatsUpdate(alerts, unacked)
   }, [alerts, onStatsUpdate])
 
@@ -107,7 +107,7 @@ export default function AlertPanel({ onStatsUpdate, onNewAlert, onTrackPlate, on
     setClearing(true)
     setConfirmClear(false)
     try {
-      const unackedBefore = alerts.filter((a) => !a.acknowledged).length
+      const unackedBefore = alerts.filter((a) => !a.acknowledged && a.requires_acknowledgment !== false).length
       await acknowledgeBulkEvents({})
       setAlerts((prev) => prev.map((a) => ({ ...a, acknowledged: true, acknowledged_by: 'operator' })))
       onAcknowledge?.(unackedBefore || 1)
@@ -143,7 +143,7 @@ export default function AlertPanel({ onStatsUpdate, onNewAlert, onTrackPlate, on
           <span>{wsLabel[wsStatus] ?? wsStatus}</span>
           <span className="alert-count">({alerts.length})</span>
         </div>
-        {alerts.some((a) => !a.acknowledged) && (
+        {alerts.some((a) => !a.acknowledged && a.requires_acknowledgment !== false) && (
           <button
             type="button"
             className={`btn-clear-all ${confirmClear ? 'btn-clear-confirm' : ''}`}
