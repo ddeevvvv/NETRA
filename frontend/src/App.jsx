@@ -5,22 +5,27 @@ import HealthStrip from './components/HealthStrip'
 import InvestigateView from './components/InvestigateView'
 import StatsStrip from './components/StatsStrip'
 import MapView from './components/MapView'
-import FacesView from './components/FacesView'
 import { getCameras, getCameraHealth, getAllCameraHealth, getSitesStatus } from './api'
-import { ShieldCheck, LayoutDashboard, MapPin, Search, User } from 'lucide-react'
+import { ShieldCheck, LayoutDashboard, MapPin, Search } from 'lucide-react'
 import './index.css'
 
 const VIEWS = {
   dashboard: { label: 'Dashboard', icon: LayoutDashboard },
   map: { label: 'Site Map', icon: MapPin },
   investigate: { label: 'Investigate', icon: Search },
-  faces: { label: 'Faces', icon: User },
 }
 
 export default function App() {
   const [view, setView] = useState(() => {
     const p = typeof window !== 'undefined' ? new URLSearchParams(window.location.search).get('view') : null
+    if (p === 'faces') return 'investigate'
     return (p && VIEWS[p]) ? p : 'dashboard'
+  })
+  const [initialInvestigateTab, setInitialInvestigateTab] = useState(() => {
+    if (typeof window === 'undefined') return ''
+    const params = new URLSearchParams(window.location.search)
+    if (params.get('view') === 'faces') return 'faces'
+    return params.get('tab') || ''
   })
   const [cameras, setCameras] = useState([])
   const [healthMap, setHealthMap] = useState({})
@@ -141,18 +146,26 @@ export default function App() {
   }, [])
 
   // ── Authoritative unacked counter — sourced from sites/status (same as Map view) ──
-  // Fetched immediately on mount, then reconciled every 5 s so the Dashboard counter
-  // always agrees with the Map pins even after bulk-acks, second-tab actions, or
-  // missed WS frames. WS events still provide live +1/-1 increments between polls.
+  // Only polls on dashboard view (map view has its own poller). Uses AbortController
+  // to cancel stale in-flight requests and prevent connection pile-up.
+  const unackedAbortRef = useRef(null)
   const refreshUnackedCount = useCallback(async () => {
+    // Skip when MapView is active — it has its own sites/status poll
+    if (view === 'map') return
+    if (unackedAbortRef.current) unackedAbortRef.current.abort()
+    const ac = new AbortController()
+    unackedAbortRef.current = ac
     try {
-      const sites = await getSitesStatus()
+      const res = await fetch('/api/v1/sites/status', { signal: ac.signal })
+      if (!res.ok) throw new Error(`status ${res.status}`)
+      const sites = await res.json()
       const total = sites.reduce((sum, s) => sum + (s.unacked_alert_count ?? 0), 0)
       setUnackedCount(total)
     } catch (e) {
+      if (e.name === 'AbortError') return
       console.error('Failed to refresh unacked count:', e)
     }
-  }, [])
+  }, [view])
 
   const handleAcknowledge = useCallback((count = 1) => {
     setUnackedCount((c) => Math.max(0, c - count))
@@ -160,43 +173,67 @@ export default function App() {
   }, [refreshUnackedCount])
 
   useEffect(() => {
-    refreshUnackedCount()                            // seed immediately on mount
-    const t = setInterval(refreshUnackedCount, 5000) // reconcile every 5 s (matches Map)
-    return () => clearInterval(t)
+    refreshUnackedCount()
+    const t = setInterval(refreshUnackedCount, 5000)
+    return () => {
+      clearInterval(t)
+      if (unackedAbortRef.current) unackedAbortRef.current.abort()
+    }
   }, [refreshUnackedCount])
 
-  // Single consolidated health polling source — runs every 10 seconds
+  // Single consolidated health polling source — runs every 10 seconds.
+  // Only active on dashboard view. Uses AbortController to prevent pile-up.
+  const healthAbortRef = useRef(null)
   const refreshHealth = useCallback(async () => {
     if (!cameras.length) return
+    // Only poll health when dashboard is visible — other views don't render camera feeds
+    if (view !== 'dashboard') return
+    if (healthAbortRef.current) healthAbortRef.current.abort()
+    const ac = new AbortController()
+    healthAbortRef.current = ac
     try {
-      const allHealth = await getAllCameraHealth()
+      const res = await fetch('/api/v1/cameras/health-all', { signal: ac.signal })
+      if (!res.ok) throw new Error(`status ${res.status}`)
+      const allHealth = await res.json()
       if (allHealth && typeof allHealth === 'object' && Object.keys(allHealth).length > 0) {
         setHealthMap(allHealth)
         return
       }
     } catch (e) {
+      if (e.name === 'AbortError') return
       console.warn('getAllCameraHealth failed, falling back:', e)
     }
 
-    const results = await Promise.allSettled(
-      cameras.map((c) => getCameraHealth(c.id).then((h) => ({ id: c.id, h })))
-    )
-    const map = {}
-    results.forEach((r) => {
-      if (r.status === 'fulfilled') {
-        map[r.value.id] = r.value.h
+    try {
+      const results = await Promise.allSettled(
+        cameras.map((c) =>
+          fetch(`/api/v1/cameras/${c.id}/health`, { signal: ac.signal })
+            .then((r) => r.json())
+            .then((h) => ({ id: c.id, h }))
+        )
+      )
+      const map = {}
+      results.forEach((r) => {
+        if (r.status === 'fulfilled') {
+          map[r.value.id] = r.value.h
+        }
+      })
+      if (Object.keys(map).length > 0) {
+        setHealthMap(map)
       }
-    })
-    if (Object.keys(map).length > 0) {
-      setHealthMap(map)
+    } catch (e) {
+      if (e.name === 'AbortError') return
     }
-  }, [cameras])
+  }, [cameras, view])
 
   useEffect(() => {
     if (!cameras.length) return
     refreshHealth()
     const t = setInterval(refreshHealth, 10_000)
-    return () => clearInterval(t)
+    return () => {
+      clearInterval(t)
+      if (healthAbortRef.current) healthAbortRef.current.abort()
+    }
   }, [cameras, refreshHealth])
 
   return (
@@ -279,11 +316,11 @@ export default function App() {
         )}
 
         {view === 'investigate' && (
-          <InvestigateView cameras={cameras} initialPlate={trackPlateTarget} />
-        )}
-
-        {view === 'faces' && (
-          <FacesView />
+          <InvestigateView
+            cameras={cameras}
+            initialPlate={trackPlateTarget}
+            initialTab={initialInvestigateTab}
+          />
         )}
       </div>
     </div>

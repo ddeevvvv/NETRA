@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { getVehicleSightings, downloadVehicleEvidencePackage } from '../api'
 import {
   Car,
@@ -37,7 +37,7 @@ export default function VehicleTrackTimeline({ cameras = [], initialPlate = '' }
   const [selectedSnapshot, setSelectedSnapshot] = useState(null)
   const [exportingDossier, setExportingDossier] = useState(false)
   const [dossierError, setDossierError] = useState(null)
-
+  const abortControllerRef = useRef(null)
 
   // Map camera IDs to consistent visual color tokens
   const cameraColorMap = {}
@@ -49,18 +49,34 @@ export default function VehicleTrackTimeline({ cameras = [], initialPlate = '' }
     const target = (plateToSearch || searchPlate).trim()
     if (!target) return
     setActivePlate(target)
+
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort()
+    }
+    const ac = new AbortController()
+    abortControllerRef.current = ac
+
     setLoading(true)
     setError(null)
     try {
-      const data = await getVehicleSightings(target)
-      setSightings(data)
+      const data = await getVehicleSightings(target, ac.signal)
+      setSightings(Array.isArray(data) ? data : [])
     } catch (err) {
+      if (err.name === 'AbortError') return
       setError(err.message)
       setSightings([])
     } finally {
       setLoading(false)
     }
   }
+
+  useEffect(() => {
+    return () => {
+      if (abortControllerRef.current) {
+        abortControllerRef.current.abort()
+      }
+    }
+  }, [])
 
   // Trigger auto-search if initialPlate is passed
   useEffect(() => {

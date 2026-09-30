@@ -82,13 +82,30 @@ export default function MapView({ onNavigateToDashboard }) {
   const markersLayerRef = useRef(null)
   const restrictionsLayerRef = useRef(null)
   const drawHandlerRef = useRef(null)
+  const abortControllerRef = useRef(null)
 
   const fetchSitesAndRestrictions = useCallback(async () => {
+    // Cancel any previous in-flight request to prevent pile-up
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort()
+    }
+    const controller = new AbortController()
+    abortControllerRef.current = controller
+
     try {
       setError(null)
       const [sitesData, restrictionsData] = await Promise.all([
-        getSitesStatus(),
-        getSiteRestrictions().catch(() => []),
+        fetch('/api/v1/sites/status', { signal: controller.signal }).then((r) => {
+          if (!r.ok) throw new Error(`GET /sites/status failed: ${r.status}`)
+          return r.json()
+        }),
+        fetch('/api/v1/sites/restrictions', { signal: controller.signal }).then((r) => {
+          if (!r.ok) throw new Error(`GET /sites/restrictions failed: ${r.status}`)
+          return r.json()
+        }).catch((e) => {
+          if (e.name === 'AbortError') throw e
+          return []
+        }),
       ])
 
       const validSites = Array.isArray(sitesData) ? sitesData : []
@@ -102,6 +119,7 @@ export default function MapView({ onNavigateToDashboard }) {
         return validSites.find((s) => s.id === prev.id) || prev
       })
     } catch (err) {
+      if (err.name === 'AbortError') return // Expected — previous request cancelled
       console.error('Failed to load sites/restrictions status:', err)
       setError(err.message)
     } finally {
@@ -112,7 +130,13 @@ export default function MapView({ onNavigateToDashboard }) {
   useEffect(() => {
     fetchSitesAndRestrictions()
     const timer = setInterval(fetchSitesAndRestrictions, 5000)
-    return () => clearInterval(timer)
+    return () => {
+      clearInterval(timer)
+      // Abort any in-flight request when component unmounts
+      if (abortControllerRef.current) {
+        abortControllerRef.current.abort()
+      }
+    }
   }, [fetchSitesAndRestrictions])
 
   // Initialize Leaflet Map

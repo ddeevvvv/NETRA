@@ -85,38 +85,39 @@ export async function deleteZone(zoneId) {
 
 /**
  * Fetch events with optional filters.
- * @param {object} filters - { camera_id, type, severity, start_time, end_time, limit, offset }
+ * @param {object} filters - { camera_id, type, severity, start_time, end_time, limit, offset, signal }
  */
 export async function getEvents(filters = {}) {
+  const { signal, ...rest } = filters
   const params = new URLSearchParams()
-  if (filters.camera_id)  params.set('camera_id',  filters.camera_id)
-  if (filters.type)       params.set('type',        filters.type)
-  if (filters.severity)   params.set('severity',    filters.severity)
-  if (filters.acknowledged !== undefined && filters.acknowledged !== null) {
-    params.set('acknowledged', filters.acknowledged)
+  if (rest.camera_id)  params.set('camera_id',  rest.camera_id)
+  if (rest.type)       params.set('type',        rest.type)
+  if (rest.severity)   params.set('severity',    rest.severity)
+  if (rest.acknowledged !== undefined && rest.acknowledged !== null) {
+    params.set('acknowledged', rest.acknowledged)
   }
-  if (filters.requires_acknowledgment !== undefined && filters.requires_acknowledgment !== null) {
-    params.set('requires_acknowledgment', filters.requires_acknowledgment)
+  if (rest.requires_acknowledgment !== undefined && rest.requires_acknowledgment !== null) {
+    params.set('requires_acknowledgment', rest.requires_acknowledgment)
   }
-  if (filters.start_time) params.set('start_time',  filters.start_time)
-  if (filters.end_time)   params.set('end_time',    filters.end_time)
-  params.set('limit',  filters.limit  ?? 100)
-  params.set('offset', filters.offset ?? 0)
-  const res = await fetch(`${BASE}/events?${params}`)
+  if (rest.start_time) params.set('start_time',  rest.start_time)
+  if (rest.end_time)   params.set('end_time',    rest.end_time)
+  params.set('limit',  rest.limit  ?? 100)
+  params.set('offset', rest.offset ?? 0)
+  const res = await fetch(`${BASE}/events?${params}`, { signal })
   if (!res.ok) throw new Error(`GET /events failed: ${res.status}`)
   return res.json()
 }
 
 /**
  * Fetch clustered incident summaries.
- * @param {{ camera_id?: string, window_minutes?: number, only_unacked?: boolean }} opts
+ * @param {{ camera_id?: string, window_minutes?: number, only_unacked?: boolean, signal?: AbortSignal }} opts
  */
-export async function getIncidentSummaries({ camera_id, window_minutes = 30, only_unacked = true } = {}) {
+export async function getIncidentSummaries({ camera_id, window_minutes = 30, only_unacked = true, signal } = {}) {
   const params = new URLSearchParams()
   if (camera_id) params.set('camera_id', camera_id)
   params.set('window_minutes', window_minutes)
   params.set('only_unacked', only_unacked)
-  const res = await fetch(`${BASE}/events/summaries?${params}`)
+  const res = await fetch(`${BASE}/events/summaries?${params}`, { signal })
   if (!res.ok) throw new Error(`GET /events/summaries failed: ${res.status}`)
   return res.json()
 }
@@ -210,10 +211,11 @@ export function connectAlertStream(onMessage, onStatusChange) {
 /**
  * Fetch chronological sighting history for a vehicle plate across all cameras.
  * @param {string} plate
+ * @param {AbortSignal} [signal]
  */
-export async function getVehicleSightings(plate) {
+export async function getVehicleSightings(plate, signal) {
   if (!plate || !plate.trim()) return []
-  const res = await fetch(`${BASE}/vehicles/${encodeURIComponent(plate.trim())}/sightings`)
+  const res = await fetch(`${BASE}/vehicles/${encodeURIComponent(plate.trim())}/sightings`, { signal })
   if (!res.ok) {
     const err = await res.json().catch(() => ({}))
     throw new Error(err.detail || `GET /vehicles/${plate}/sightings failed: ${res.status}`)

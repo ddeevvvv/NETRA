@@ -1,6 +1,7 @@
-import { useState, useEffect, Fragment } from 'react'
+import { useState, useEffect, useCallback, useRef, Fragment } from 'react'
 import { getEvents, acknowledgeEvent, getIncidentSummaries, downloadIncidentEvidencePackage, downloadEventEvidencePackage } from '../api'
 import VehicleTrackTimeline from './VehicleTrackTimeline'
+import FacesView from './FacesView'
 import {
   Search,
   Check,
@@ -21,17 +22,21 @@ import {
   FileDown,
   Download,
   Loader2,
+  User,
 } from 'lucide-react'
-
 
 const EVENT_TYPES = ['', 'INTRUSION', 'FACE_DETECTED', 'ANPR_MATCH', 'ANPR_READ', 'CAMERA_HEALTH', 'LOITERING', 'ZONE_ENTRY', 'ZONE_EXIT']
 const SEVERITIES = ['', 'INFO', 'WARNING', 'HIGH', 'CRITICAL']
 
 /**
- * InvestigateView — historical event queries and vehicle tracking timeline.
+ * InvestigateView — historical event queries, vehicle tracking timeline, and face detections.
  */
-export default function InvestigateView({ cameras, initialPlate = '' }) {
-  const [activeSubTab, setActiveSubTab] = useState(initialPlate ? 'track' : 'summaries')
+export default function InvestigateView({ cameras, initialPlate = '', initialTab = '' }) {
+  const [activeSubTab, setActiveSubTab] = useState(() => {
+    if (initialTab) return initialTab
+    if (initialPlate) return 'track'
+    return 'summaries'
+  })
   const [filters, setFilters] = useState({
     camera_id: '',
     type: '',
@@ -52,21 +57,22 @@ export default function InvestigateView({ cameras, initialPlate = '' }) {
   const [summaryWindow, setSummaryWindow] = useState(5)
   const [summaryCameraFilter, setSummaryCameraFilter] = useState('')
 
+  const summariesAbortRef = useRef(null)
+  const searchAbortRef = useRef(null)
+
   useEffect(() => {
     if (initialPlate) {
       setActiveSubTab('track')
     }
   }, [initialPlate])
 
-  // Auto-load summaries on mount
-  useEffect(() => {
-    if (activeSubTab === 'summaries') {
-      fetchSummaries()
+  const fetchSummaries = useCallback(async () => {
+    if (summariesAbortRef.current) {
+      summariesAbortRef.current.abort()
     }
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeSubTab])
+    const ac = new AbortController()
+    summariesAbortRef.current = ac
 
-  const fetchSummaries = async () => {
     setSummariesLoading(true)
     setSummariesError(null)
     try {
@@ -74,32 +80,58 @@ export default function InvestigateView({ cameras, initialPlate = '' }) {
         camera_id: summaryCameraFilter || undefined,
         window_minutes: summaryWindow,
         only_unacked: true,
+        signal: ac.signal,
       })
       setSummariesData(data)
     } catch (e) {
+      if (e.name === 'AbortError') return
       setSummariesError(e.message)
     } finally {
       setSummariesLoading(false)
     }
-  }
+  }, [summaryCameraFilter, summaryWindow])
 
-  const set = (key) => (e) => setFilters((f) => ({ ...f, [key]: e.target.value }))
+  const search = useCallback(async () => {
+    if (searchAbortRef.current) {
+      searchAbortRef.current.abort()
+    }
+    const ac = new AbortController()
+    searchAbortRef.current = ac
 
-  const search = async () => {
     setLoading(true)
     setError(null)
     try {
       const f = { ...filters }
       if (f.start_time) f.start_time = new Date(f.start_time).toISOString()
       if (f.end_time) f.end_time = new Date(f.end_time).toISOString()
-      const data = await getEvents(f)
+      const data = await getEvents({ ...f, signal: ac.signal })
       setEvents(data)
     } catch (e) {
+      if (e.name === 'AbortError') return
       setError(e.message)
     } finally {
       setLoading(false)
     }
-  }
+  }, [filters])
+
+  // Auto-load tab data on activeSubTab change
+  useEffect(() => {
+    if (activeSubTab === 'summaries') {
+      fetchSummaries()
+    } else if (activeSubTab === 'events' && events === null) {
+      search()
+    }
+  }, [activeSubTab, fetchSummaries, search, events])
+
+  // Cleanup in-flight requests on unmount
+  useEffect(() => {
+    return () => {
+      if (summariesAbortRef.current) summariesAbortRef.current.abort()
+      if (searchAbortRef.current) searchAbortRef.current.abort()
+    }
+  }, [])
+
+  const set = (key) => (e) => setFilters((f) => ({ ...f, [key]: e.target.value }))
 
   const handleAck = async (eventId, e) => {
     e.stopPropagation()
@@ -107,11 +139,13 @@ export default function InvestigateView({ cameras, initialPlate = '' }) {
     try {
       const updated = await acknowledgeEvent(eventId, 'operator')
       setEvents((prev) =>
-        prev.map((ev) =>
-          ev.id === updated.id
-            ? { ...ev, acknowledged: true, acknowledged_by: updated.acknowledged_by }
-            : ev
-        )
+        prev
+          ? prev.map((ev) =>
+              ev.id === updated.id
+                ? { ...ev, acknowledged: true, acknowledged_by: updated.acknowledged_by }
+                : ev
+            )
+          : prev
       )
     } catch (e) {
       alert('Acknowledge failed: ' + e.message)
@@ -150,6 +184,15 @@ export default function InvestigateView({ cameras, initialPlate = '' }) {
           <Car size={13} />
           <span>Track Vehicle Sightings</span>
         </button>
+
+        <button
+          type="button"
+          className={`subtab-btn ${activeSubTab === 'faces' ? 'subtab-active' : ''}`}
+          onClick={() => setActiveSubTab('faces')}
+        >
+          <User size={13} />
+          <span>Face Detections</span>
+        </button>
       </div>
 
       {activeSubTab === 'track' ? (
@@ -166,6 +209,8 @@ export default function InvestigateView({ cameras, initialPlate = '' }) {
           onCameraFilterChange={setSummaryCameraFilter}
           onRefresh={fetchSummaries}
         />
+      ) : activeSubTab === 'faces' ? (
+        <FacesView cameras={cameras} />
       ) : (
         <>
           {/* ── Filter bar ── */}

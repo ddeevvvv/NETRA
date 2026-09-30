@@ -200,7 +200,19 @@ function CameraCard({
   const [localRetryKey, setLocalRetryKey] = useState(0)
   const [mousePos, setMousePos] = useState(null)
   const feedWrapRef = useRef(null)
+  const streamImgRef = useRef(null)
   const status = healthStatus(health)
+
+  // Force-close the MJPEG stream HTTP connection on unmount.
+  // Without this, navigating away from Dashboard leaves long-lived connections
+  // open, saturating Chrome's 6-connection-per-origin HTTP/1.1 limit.
+  useEffect(() => {
+    return () => {
+      if (streamImgRef.current) {
+        streamImgRef.current.src = ''
+      }
+    }
+  }, [])
 
   const handleRetry = () => {
     setStreamError(false)
@@ -371,6 +383,7 @@ function CameraCard({
           </div>
         ) : (
           <img
+            ref={streamImgRef}
             key={totalStreamKey}
             src={`${debugStreamUrl(cam.id)}?t=${totalStreamKey}`}
             alt={`Live feed: ${cam.id}`}
